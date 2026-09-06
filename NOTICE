@@ -1,0 +1,11 @@
+Montlok RDT4quant CPU Runtime
+
+The Mamba-3 SISO recurrence in rdt4quant_cpu/mamba3_cpu.py and
+rdt4quant_cpu/montlok.cpp is derived from the public reference equations in:
+
+  Copyright 2026 Dao AI Lab and GoombaLab.
+  https://github.com/state-spaces/mamba/blob/main/tests/ops/triton/test_mamba3_siso.py
+
+The included minimal RDT runtime files retain their upstream Apache-2.0 terms.
+All modifications are identified in the CPU runtime source and repository
+history.

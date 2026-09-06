@@ -1,0 +1,54 @@
+{
+  "kind": "chronological_saved_official_cuda_vs_cpu_reference",
+  "samples": 2000,
+  "threads": 32,
+  "batch_size": 4,
+  "compiled_transformer": true,
+  "checkpoint_sha256": "3710f03968d9b50d07263378135e162a006eda9bd8ceb5d1bb4de4049c4c93db",
+  "data_sha256": "f54ad3d616868ed65705733e6406525068dcba7622682d6b26e7011dd952d178",
+  "data_manifest_sha256": "ecefa1394ba3d562a7b0068771fa4905635230fdbc5f3c15e8b5e0a4c5f892e2",
+  "official_predictions_sha256": "69d40b3e318a90ba2f16eb433059e8850e72092c9451a8d578d13c8ce891bae7",
+  "latency_batch_p50_ms": 350.9713020030176,
+  "latency_batch_p95_ms": 420.2622181444894,
+  "latency_per_window_p50_ms": 87.7428255007544,
+  "max_abs_bps_difference": 145.5217373686391,
+  "p95_abs_bps_difference": 27.727657343062056,
+  "median_abs_bps_difference": 2.5210769123854115,
+  "per_horizon_max_abs_bps": [
+    12.65782090072628,
+    49.686146020999495,
+    145.5217373686391
+  ],
+  "median_prediction_correlation": [
+    0.9732688812933492,
+    0.9727640027567335,
+    0.9525739028190702
+  ],
+  "thresholds_240m": {
+    "0.0": {
+      "agreement": 0.9245,
+      "flips": 151,
+      "official_long": 1029,
+      "cpu_long": 986
+    },
+    "12.0": {
+      "agreement": 0.9195,
+      "flips": 161,
+      "official_long": 739,
+      "cpu_long": 632
+    },
+    "24.0": {
+      "agreement": 0.9165,
+      "flips": 167,
+      "official_long": 508,
+      "cpu_long": 371
+    },
+    "40.0": {
+      "agreement": 0.9435,
+      "flips": 113,
+      "official_long": 321,
+      "cpu_long": 220
+    }
+  },
+  "orders_sent": false
+}
