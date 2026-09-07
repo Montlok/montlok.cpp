@@ -99,6 +99,7 @@ def main() -> None:
                 "MONTLOK_DNNL_MIN_ROWS",
                 "MONTLOK_CPP_NATIVE_STAGE1",
                 "MONTLOK_CPP_NATIVE_STAGE2",
+                "MONTLOK_STAGE2_INPLACE",
                 "MONTLOK_OPENMP",
                 "MONTLOK_SERIAL_WORK",
             )

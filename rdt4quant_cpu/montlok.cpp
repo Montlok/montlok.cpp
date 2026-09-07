@@ -74,6 +74,7 @@ torch::Tensor linear_dispatch(
     }
     static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow("mkldnn::_linear_pointwise", "");
     c10::Stack stack;
+    stack.reserve(6);
     stack.emplace_back(input);
     stack.emplace_back(weight);
     stack.emplace_back(bias.has_value() ? c10::IValue(*bias) : c10::IValue());
@@ -491,7 +492,7 @@ MhcPrepareOutputs mhc_prepare_plan(
     auto scalar_value = [](const torch::Tensor& value, const char* name) {
         require_f32_cpu(value, name);
         TORCH_CHECK(value.numel() == 1, name, " must be a scalar");
-        return static_cast<double>(value.item<float>());
+        return static_cast<double>(value.data_ptr<float>()[0]);
     };
 
     const auto options = torch::dtype(torch::kFloat32).device(torch::kCPU);
@@ -553,6 +554,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mhc_prepa
     double agg_norm_eps) {
     const StreamsView view = streams_view(streams, n_streams, "streams");
     std::vector<torch::Tensor> keep_alive;
+    keep_alive.reserve(5);
     montlok::MhcPlan plan{};
     MhcPrepareOutputs outputs = mhc_prepare_plan(plan, view, norm_w, eps, proj_w, pre_bias, post_bias, res_bias,
                                                  pre_alpha, post_alpha, res_alpha, sinkhorn_iters, agg_norm_w,
@@ -668,6 +670,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     combine.new_streams = new_streams.data_ptr<float>();
 
     std::vector<torch::Tensor> keep_alive;
+    keep_alive.reserve(5);
     montlok::MhcPlan prepare{};
     MhcPrepareOutputs outputs = mhc_prepare_plan(prepare, view, norm_w, eps, proj_w, pre_bias, post_bias, res_bias,
                                                  pre_alpha, post_alpha, res_alpha, sinkhorn_iters, agg_norm_w,
@@ -683,6 +686,52 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     }, mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
        outputs.agg);
     return std::make_tuple(new_streams, outputs.agg, outputs.pre, outputs.post, outputs.res);
+}
+
+// Internal Stage-2 state transition. Once the broadcast backbone has been
+// materialised, every subsequent mHC write can reuse that allocation. The
+// SIMD kernel loads all old stream lanes before storing any replacement lane.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mhc_combine_prepare_inplace(
+    torch::Tensor& streams,
+    const torch::Tensor& res,
+    const torch::Tensor& post,
+    const torch::Tensor& out,
+    const torch::Tensor& norm_w,
+    double eps,
+    const torch::Tensor& proj_w,
+    const torch::Tensor& pre_bias,
+    const torch::Tensor& post_bias,
+    const torch::Tensor& res_bias,
+    const torch::Tensor& pre_alpha,
+    const torch::Tensor& post_alpha,
+    const torch::Tensor& res_alpha,
+    int64_t sinkhorn_iters,
+    const std::optional<torch::Tensor>& agg_norm_w,
+    double agg_norm_eps) {
+    const StreamsView view = streams_view(streams, res.dim() == 4 ? res.size(-1) : 0, "streams");
+    TORCH_CHECK(streams.dim() == 4 && view.stream_stride == view.d,
+                "in-place mHC requires materialised contiguous streams");
+    TORCH_CHECK(view.n <= 8, "in-place mHC supports at most eight streams");
+    montlok::MhcCombinePlan combine = mhc_combine_plan(view, res, post, out);
+    combine.new_streams = streams.data_ptr<float>();
+
+    std::vector<torch::Tensor> keep_alive;
+    keep_alive.reserve(5);
+    montlok::MhcPlan prepare{};
+    MhcPrepareOutputs outputs = mhc_prepare_plan(prepare, view, norm_w, eps, proj_w, pre_bias, post_bias, res_bias,
+                                                 pre_alpha, post_alpha, res_alpha, sinkhorn_iters, agg_norm_w,
+                                                 agg_norm_eps, keep_alive);
+    prepare.streams = combine.new_streams;
+    prepare.stream_stride = view.d;
+    prepare.token_stride = view.n * view.d;
+
+    const int64_t scratch_doubles = montlok::mhc_scratch_doubles(prepare);
+    parallel_items(prepare.tokens, montlok::kMhcTokenBlock, [&](int64_t begin, int64_t end) {
+        std::vector<double> scratch(static_cast<size_t>(scratch_doubles));
+        montlok::mhc_combine_prepare_inplace_range(combine, prepare, begin, end, scratch.data());
+    }, mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
+       outputs.agg);
+    return std::make_tuple(outputs.agg, outputs.pre, outputs.post, outputs.res);
 }
 
 // RMSNorm / GroupedRMSNorm (Model/layers/rmsnorm.py) over the last dimension.
@@ -1042,6 +1091,15 @@ torch::Tensor stage2_tail_forward(
                                    next_hc[3], next_hc[4], next_hc[5], next_hc[6], next_hc[7], next_iters,
                                    output_norm_weight, output_norm_eps);
     };
+    auto combine_prepare_same_storage = [&](torch::Tensor& streams, const torch::Tensor& res,
+                                            const torch::Tensor& post, const torch::Tensor& out,
+                                            const std::vector<torch::Tensor>& next_hc, double next_eps,
+                                            int64_t next_iters, const torch::Tensor& output_norm_weight,
+                                            double output_norm_eps) {
+        return mhc_combine_prepare_inplace(streams, res, post, out, next_hc[0], next_eps, next_hc[1], next_hc[2],
+                                           next_hc[3], next_hc[4], next_hc[5], next_hc[6], next_hc[7], next_iters,
+                                           output_norm_weight, output_norm_eps);
+    };
     auto run_mla = [&](const torch::Tensor& input, int64_t n_last) {
         const torch::Tensor& projection = n_last == input.size(1) ? mla[0] : mla[1];
         return mla_forward(input, projection, mla[2], mla[3], mla[4], kv_norm_eps, mla[5], mla[6], mla[7], mla[8],
@@ -1054,6 +1112,8 @@ torch::Tensor stage2_tail_forward(
     torch::Tensor agg = std::get<0>(first);
     torch::Tensor post = std::get<2>(first);
     torch::Tensor res = std::get<3>(first);
+    const char* inplace_env = std::getenv("MONTLOK_STAGE2_INPLACE");
+    const bool use_inplace = n_streams <= 8 && (inplace_env == nullptr || std::string_view(inplace_env) != "0");
 
     const std::optional<torch::Tensor> ffn_in_bias = ffn[1].numel() ? std::optional<torch::Tensor>(ffn[1]) : std::nullopt;
     const std::optional<torch::Tensor> ffn_out_bias = ffn[3].numel() ? std::optional<torch::Tensor>(ffn[3]) : std::nullopt;
@@ -1073,16 +1133,39 @@ torch::Tensor stage2_tail_forward(
         }
 
         auto attn_out = run_mla(agg, agg.size(1));
-        auto ffn_prepared = combine_prepare(streams, res, post, attn_out, ffn_hc, ffn_hc_eps,
-                                            ffn_sinkhorn_iters, ffn_norm_weight, ffn_norm_eps);
-        streams = std::get<0>(ffn_prepared);
-        auto ffn_out = swiglu_mlp(std::get<1>(ffn_prepared), ffn[0], ffn_in_bias, ffn[2], ffn_out_bias);
-        auto next_attn = combine_prepare(streams, std::get<4>(ffn_prepared), std::get<3>(ffn_prepared), ffn_out,
-                                         attn_hc, attn_hc_eps, attn_sinkhorn_iters, attn_norm_weight, attn_norm_eps);
-        streams = std::get<0>(next_attn);
-        agg = std::get<1>(next_attn);
-        post = std::get<3>(next_attn);
-        res = std::get<4>(next_attn);
+        torch::Tensor ffn_agg;
+        torch::Tensor ffn_post;
+        torch::Tensor ffn_res;
+        if (use_inplace && streams.dim() == 4) {
+            auto ffn_prepared = combine_prepare_same_storage(streams, res, post, attn_out, ffn_hc, ffn_hc_eps,
+                                                             ffn_sinkhorn_iters, ffn_norm_weight, ffn_norm_eps);
+            ffn_agg = std::get<0>(ffn_prepared);
+            ffn_post = std::get<2>(ffn_prepared);
+            ffn_res = std::get<3>(ffn_prepared);
+        } else {
+            auto ffn_prepared = combine_prepare(streams, res, post, attn_out, ffn_hc, ffn_hc_eps,
+                                                ffn_sinkhorn_iters, ffn_norm_weight, ffn_norm_eps);
+            streams = std::get<0>(ffn_prepared);
+            ffn_agg = std::get<1>(ffn_prepared);
+            ffn_post = std::get<3>(ffn_prepared);
+            ffn_res = std::get<4>(ffn_prepared);
+        }
+        auto ffn_out = swiglu_mlp(ffn_agg, ffn[0], ffn_in_bias, ffn[2], ffn_out_bias);
+        if (use_inplace) {
+            auto next_attn = combine_prepare_same_storage(streams, ffn_res, ffn_post, ffn_out, attn_hc,
+                                                           attn_hc_eps, attn_sinkhorn_iters, attn_norm_weight,
+                                                           attn_norm_eps);
+            agg = std::get<0>(next_attn);
+            post = std::get<2>(next_attn);
+            res = std::get<3>(next_attn);
+        } else {
+            auto next_attn = combine_prepare(streams, ffn_res, ffn_post, ffn_out, attn_hc, attn_hc_eps,
+                                             attn_sinkhorn_iters, attn_norm_weight, attn_norm_eps);
+            streams = std::get<0>(next_attn);
+            agg = std::get<1>(next_attn);
+            post = std::get<3>(next_attn);
+            res = std::get<4>(next_attn);
+        }
     }
     TORCH_INTERNAL_ASSERT(false, "unreachable stage-2 loop");
     return torch::Tensor();

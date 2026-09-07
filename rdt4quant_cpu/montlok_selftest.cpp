@@ -533,6 +533,23 @@ void test_mhc(const MhcCase& c, bool timing) {
         check(std::string(name) + " fused pre", max_abs_diff(pre3, std::vector<double>(pre2.begin(), pre2.end())), 0.0);
         check(std::string(name) + " fused post", max_abs_diff(post3, std::vector<double>(post2.begin(), post2.end())), 0.0);
         check(std::string(name) + " fused res", max_abs_diff(res3, std::vector<double>(res2.begin(), res2.end())), 0.0);
+        if (n <= 8) {
+            std::vector<float> inplace_streams = streams;
+            std::vector<float> agg4(T * d), pre4(T * n), post4(T * n), res4(T * n * n);
+            montlok::MhcPlan p4 = p;
+            p4.streams = inplace_streams.data();
+            p4.agg = agg4.data(); p4.pre = pre4.data(); p4.post = post4.data(); p4.res = res4.data();
+            montlok::MhcCombinePlan cp4 = cp;
+            cp4.streams = inplace_streams.data();
+            cp4.new_streams = inplace_streams.data();
+            montlok::mhc_combine_prepare_inplace_range(cp4, p4, 0, T, scratch.data());
+            check(std::string(name) + " in-place streams",
+                  max_abs_diff(inplace_streams, std::vector<double>(new_streams.begin(), new_streams.end())), 0.0);
+            check(std::string(name) + " in-place agg", max_abs_diff(agg4, std::vector<double>(agg2.begin(), agg2.end())), 0.0);
+            check(std::string(name) + " in-place pre", max_abs_diff(pre4, std::vector<double>(pre2.begin(), pre2.end())), 0.0);
+            check(std::string(name) + " in-place post", max_abs_diff(post4, std::vector<double>(post2.begin(), post2.end())), 0.0);
+            check(std::string(name) + " in-place res", max_abs_diff(res4, std::vector<double>(res2.begin(), res2.end())), 0.0);
+        }
     }
 
     // Broadcast streams (the expanded backbone) must match the materialised copy.

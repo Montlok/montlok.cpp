@@ -483,6 +483,77 @@ inline void mhc_combine_range(const MhcCombinePlan& c, int64_t begin, int64_t en
     }
 }
 
+// In-place variant for an already materialised contiguous stream tensor. All
+// old stream lanes for one SIMD chunk are loaded before any new lane is
+// stored, so input and output may be the same allocation without changing the
+// accumulation or float32 rounding order of mhc_combine_token_n.
+template <int N>
+inline void mhc_combine_token_inplace_n(float* streams, const float* __restrict res,
+                                        const float* __restrict post, const float* __restrict out,
+                                        int64_t d) noexcept {
+    int64_t k = 0;
+#ifdef MONTLOK_VECTOR_EXT
+    for (; k + 4 <= d; k += 4) {
+        const v4d o = load4f_as_d(out + k);
+        v4d old_streams[N];
+        for (int j = 0; j < N; ++j) {
+            old_streams[j] = load4f_as_d(streams + j * d + k);
+        }
+        v4d new_streams[N];
+        for (int i = 0; i < N; ++i) {
+            v4d acc = splat4d(static_cast<double>(post[i])) * o;
+            for (int j = 0; j < N; ++j) {
+                acc += splat4d(static_cast<double>(res[i * N + j])) * old_streams[j];
+            }
+            new_streams[i] = acc;
+        }
+        for (int i = 0; i < N; ++i) {
+            store4d_as_f(streams + i * d + k, new_streams[i]);
+        }
+    }
+#endif
+    for (; k < d; ++k) {
+        double new_streams[N];
+        for (int i = 0; i < N; ++i) {
+            double acc = static_cast<double>(post[i]) * static_cast<double>(out[k]);
+            for (int j = 0; j < N; ++j) {
+                acc += static_cast<double>(res[i * N + j]) * static_cast<double>(streams[j * d + k]);
+            }
+            new_streams[i] = acc;
+        }
+        for (int i = 0; i < N; ++i) {
+            streams[i * d + k] = static_cast<float>(new_streams[i]);
+        }
+    }
+}
+
+inline void mhc_combine_token_inplace(float* streams, const float* res, const float* post, const float* out,
+                                      int64_t n, int64_t d) noexcept {
+    switch (n) {
+        case 1: return mhc_combine_token_inplace_n<1>(streams, res, post, out, d);
+        case 2: return mhc_combine_token_inplace_n<2>(streams, res, post, out, d);
+        case 3: return mhc_combine_token_inplace_n<3>(streams, res, post, out, d);
+        case 4: return mhc_combine_token_inplace_n<4>(streams, res, post, out, d);
+        case 5: return mhc_combine_token_inplace_n<5>(streams, res, post, out, d);
+        case 6: return mhc_combine_token_inplace_n<6>(streams, res, post, out, d);
+        case 7: return mhc_combine_token_inplace_n<7>(streams, res, post, out, d);
+        case 8: return mhc_combine_token_inplace_n<8>(streams, res, post, out, d);
+        default: break;
+    }
+}
+
+inline void mhc_combine_prepare_inplace_range(const MhcCombinePlan& c, const MhcPlan& p, int64_t begin,
+                                              int64_t end, double* __restrict scratch) noexcept {
+    for (int64_t token = begin; token < end; token += kMhcTokenBlock) {
+        const int64_t count = std::min<int64_t>(kMhcTokenBlock, end - token);
+        for (int64_t index = token; index < token + count; ++index) {
+            mhc_combine_token_inplace(c.new_streams + index * c.n * c.d, c.res + index * c.n * c.n,
+                                      c.post + index * c.n, c.out + index * c.d, c.n, c.d);
+        }
+        mhc_prepare_block(p, token, count, scratch);
+    }
+}
+
 // Write step of one residual fused with the read step of the next: for each
 // block of tokens the new streams are produced and immediately consumed by
 // mhc_prepare_block while they are still in L1. `p.streams` must point at

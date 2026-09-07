@@ -58,6 +58,7 @@ BACKEND_VARS = (
     "MONTLOK_DNNL_MIN_ROWS",
     "MONTLOK_CPP_NATIVE_STAGE1",
     "MONTLOK_CPP_NATIVE_STAGE2",
+    "MONTLOK_STAGE2_INPLACE",
 )
 
 
@@ -433,6 +434,8 @@ def test_full_model() -> None:
             applications = [layer for _ in range(4) for layer in model.recurrent.stage2]
             fused_full_hidden = fused_stage2(applications, backbone)
             fused_tail_hidden = fused_stage2(applications, backbone, 1)
+    with backend(MONTLOK_CPP="1", MONTLOK_STAGE2_INPLACE="0"):
+        q_copy, rms_copy, h_copy, s_copy, stock_rms_copy = run()
     with backend(MONTLOK_CPP="1", MONTLOK_CPP_NATIVE_STAGE1="0", MONTLOK_CPP_NATIVE_STAGE2="0"):
         q_python, rms_python, _h_python, s_python, stock_rms_python = run()
     with backend(MONTLOK_CPP="1", MONTLOK_CPP_MHC="0", MONTLOK_CPP_LAYERS="0"):
@@ -444,6 +447,11 @@ def test_full_model() -> None:
     report("full model crypto quantiles (full fused ops)", q_full, q_ref, quantile_tol)
     report("full model crypto quantiles (tail fused chain)", q_tail, q_ref, quantile_tol)
     report("full model native vs Python tail chain", q_tail, q_python, quantile_tol)
+    report("full model in-place vs copying Stage-2", q_tail, q_copy, 0.0)
+    report("full model in-place vs copying hidden states", h_tail_encode, h_copy, 0.0)
+    report("full model in-place vs copying equity tail", s_tail, s_copy, 0.0)
+    report("full model in-place vs copying hidden RMS", rms_tail, rms_copy, 0.0)
+    report("full model in-place vs copying stock RMS", stock_rms_tail, stock_rms_copy, 0.0)
     report("full model crypto tail vs full C++", q_tail, q_full, quantile_tol)
     report("full model equity quantiles (full fused ops)", s_full, s_ref, stock_tol)
     report("full model equity quantiles (tail fused chain)", s_tail, s_ref, stock_tol)
