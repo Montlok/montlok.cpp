@@ -549,7 +549,42 @@ void test_mhc(const MhcCase& c, bool timing) {
             check(std::string(name) + " in-place pre", max_abs_diff(pre4, std::vector<double>(pre2.begin(), pre2.end())), 0.0);
             check(std::string(name) + " in-place post", max_abs_diff(post4, std::vector<double>(post2.begin(), post2.end())), 0.0);
             check(std::string(name) + " in-place res", max_abs_diff(res4, std::vector<double>(res2.begin(), res2.end())), 0.0);
+
+            std::vector<float> reused_streams = streams;
+            std::vector<float> agg5 = agg, pre5 = pre, post5 = post, res5 = res;
+            montlok::MhcPlan p5 = p;
+            p5.streams = reused_streams.data();
+            p5.agg = agg5.data(); p5.pre = pre5.data(); p5.post = post5.data(); p5.res = res5.data();
+            montlok::MhcCombinePlan cp5 = cp;
+            cp5.streams = reused_streams.data();
+            cp5.post = post5.data(); cp5.res = res5.data(); cp5.new_streams = reused_streams.data();
+            montlok::mhc_combine_prepare_inplace_range(cp5, p5, 0, T, scratch.data());
+            check(std::string(name) + " reused streams",
+                  max_abs_diff(reused_streams, std::vector<double>(new_streams.begin(), new_streams.end())), 0.0);
+            check(std::string(name) + " reused agg", max_abs_diff(agg5, std::vector<double>(agg2.begin(), agg2.end())), 0.0);
+            check(std::string(name) + " reused pre", max_abs_diff(pre5, std::vector<double>(pre2.begin(), pre2.end())), 0.0);
+            check(std::string(name) + " reused post", max_abs_diff(post5, std::vector<double>(post2.begin(), post2.end())), 0.0);
+            check(std::string(name) + " reused res", max_abs_diff(res5, std::vector<double>(res2.begin(), res2.end())), 0.0);
         }
+
+        std::vector<float> allocated_streams(T * n * d);
+        std::vector<float> agg6 = agg, pre6 = pre, post6 = post, res6 = res;
+        montlok::MhcPlan p6 = p;
+        p6.streams = allocated_streams.data();
+        p6.agg = agg6.data(); p6.pre = pre6.data(); p6.post = post6.data(); p6.res = res6.data();
+        montlok::MhcCombinePlan cp6 = cp;
+        cp6.post = post6.data(); cp6.res = res6.data(); cp6.new_streams = allocated_streams.data();
+        montlok::mhc_combine_prepare_range(cp6, p6, 0, T, scratch.data());
+        check(std::string(name) + " reused coefficient streams",
+              max_abs_diff(allocated_streams, std::vector<double>(new_streams.begin(), new_streams.end())), 0.0);
+        check(std::string(name) + " reused coefficient agg",
+              max_abs_diff(agg6, std::vector<double>(agg2.begin(), agg2.end())), 0.0);
+        check(std::string(name) + " reused coefficient pre",
+              max_abs_diff(pre6, std::vector<double>(pre2.begin(), pre2.end())), 0.0);
+        check(std::string(name) + " reused coefficient post",
+              max_abs_diff(post6, std::vector<double>(post2.begin(), post2.end())), 0.0);
+        check(std::string(name) + " reused coefficient res",
+              max_abs_diff(res6, std::vector<double>(res2.begin(), res2.end())), 0.0);
     }
 
     // Broadcast streams (the expanded backbone) must match the materialised copy.

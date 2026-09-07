@@ -68,28 +68,32 @@ def native_stage1(core, inputs: torch.Tensor) -> torch.Tensor:
     """Bind the full Mamba/FFN stack to one native inference call."""
     from montlok_loader import load_montlok
 
-    empty = inputs.new_empty(0)
-    packs = []
-    for layer in core.stage1:
-        mixer = layer.mamba.mamba
-        packs.append(
-            (
-                layer.mamba.norm.weight,
-                mixer.in_proj.weight,
-                mixer.out_proj.weight,
-                mixer.B_bias,
-                mixer.C_bias,
-                mixer.B_norm.weight,
-                mixer.C_norm.weight,
-                mixer.dt_bias,
-                mixer.D,
-                layer.ffn_norm.weight,
-                layer.ffn.w_in.weight,
-                layer.ffn.w_in.bias if layer.ffn.w_in.bias is not None else empty,
-                layer.ffn.w_down.weight,
-                layer.ffn.w_down.bias if layer.ffn.w_down.bias is not None else empty,
+    packs = core.__dict__.get("_montlok_stage1_parameter_pack")
+    if packs is None or os.environ.get("MONTLOK_CACHE_PARAMETER_PACKS") == "0":
+        empty = inputs.new_empty(0)
+        packs = []
+        for layer in core.stage1:
+            mixer = layer.mamba.mamba
+            packs.append(
+                (
+                    layer.mamba.norm.weight,
+                    mixer.in_proj.weight,
+                    mixer.out_proj.weight,
+                    mixer.B_bias,
+                    mixer.C_bias,
+                    mixer.B_norm.weight,
+                    mixer.C_norm.weight,
+                    mixer.dt_bias,
+                    mixer.D,
+                    layer.ffn_norm.weight,
+                    layer.ffn.w_in.weight,
+                    layer.ffn.w_in.bias if layer.ffn.w_in.bias is not None else empty,
+                    layer.ffn.w_down.weight,
+                    layer.ffn.w_down.bias if layer.ffn.w_down.bias is not None else empty,
+                )
             )
-        )
+        if os.environ.get("MONTLOK_CACHE_PARAMETER_PACKS") != "0":
+            core.__dict__["_montlok_stage1_parameter_pack"] = packs
     first = core.stage1[0]
     mixer = first.mamba.mamba
     return load_montlok().stage1_forward(
@@ -157,43 +161,57 @@ def native_stage2_tail(layer, backbone: torch.Tensor, depth: int) -> torch.Tenso
     """Bind one recurrent mHC layer to the complete native stage-2 tail loop."""
     from montlok_loader import load_montlok
 
-    def hc_pack(hc):
-        return (
-            hc.dyn_norm.weight,
-            hc._projection_block(),
-            hc.pre_bias,
-            hc.post_bias,
-            hc.res_bias,
-            hc.pre_alpha,
-            hc.post_alpha,
-            hc.res_alpha,
-        )
-
     attn = layer.attn
-    cos, sin = attn._rope_tables(backbone.shape[1], 0, backbone.device)
-    empty = backbone.new_empty(0)
-    mla_pack = (
-        attn._in_proj_weight(True),
-        attn._in_proj_weight(False),
-        attn.q_proj.weight,
-        attn.kv_norm.weight,
-        attn.kv_norm.bias if attn.kv_norm.bias is not None else empty,
-        attn.kv_up.weight,
-        attn.o_proj.weight,
-        cos,
-        sin,
-    )
-    ffn_pack = (
-        layer.ffn.w_in.weight,
-        layer.ffn.w_in.bias if layer.ffn.w_in.bias is not None else empty,
-        layer.ffn.w_down.weight,
-        layer.ffn.w_down.bias if layer.ffn.w_down.bias is not None else empty,
-    )
+    cache_key = (backbone.shape[1], backbone.device.type, backbone.device.index)
+    cache = layer.__dict__.get("_montlok_stage2_parameter_packs")
+    packed = None if cache is None else cache.get(cache_key)
+    if packed is None or os.environ.get("MONTLOK_CACHE_PARAMETER_PACKS") == "0":
+        def hc_pack(hc):
+            return (
+                hc.dyn_norm.weight,
+                hc._projection_block(),
+                hc.pre_bias,
+                hc.post_bias,
+                hc.res_bias,
+                hc.pre_alpha,
+                hc.post_alpha,
+                hc.res_alpha,
+            )
+
+        cos, sin = attn._rope_tables(backbone.shape[1], 0, backbone.device)
+        empty = backbone.new_empty(0)
+        packed = (
+            hc_pack(layer.attn_hc),
+            (
+                attn._in_proj_weight(True),
+                attn._in_proj_weight(False),
+                attn.q_proj.weight,
+                attn.kv_norm.weight,
+                attn.kv_norm.bias if attn.kv_norm.bias is not None else empty,
+                attn.kv_up.weight,
+                attn.o_proj.weight,
+                cos,
+                sin,
+            ),
+            hc_pack(layer.ffn_hc),
+            (
+                layer.ffn.w_in.weight,
+                layer.ffn.w_in.bias if layer.ffn.w_in.bias is not None else empty,
+                layer.ffn.w_down.weight,
+                layer.ffn.w_down.bias if layer.ffn.w_down.bias is not None else empty,
+            ),
+        )
+        if os.environ.get("MONTLOK_CACHE_PARAMETER_PACKS") != "0":
+            if cache is None:
+                cache = {}
+                layer.__dict__["_montlok_stage2_parameter_packs"] = cache
+            cache[cache_key] = packed
+    attn_hc_pack, mla_pack, ffn_hc_pack, ffn_pack = packed
     return load_montlok().stage2_tail_forward(
         backbone,
         depth,
         layer.attn_hc.n_streams,
-        hc_pack(layer.attn_hc),
+        attn_hc_pack,
         layer.attn_hc.dyn_norm.eps,
         layer.attn_hc.sinkhorn_iters,
         layer.attn_norm.weight,
@@ -205,7 +223,7 @@ def native_stage2_tail(layer, backbone: torch.Tensor, depth: int) -> torch.Tenso
         attn.nope_dim,
         attn.kv_lora_rank,
         attn.scale,
-        hc_pack(layer.ffn_hc),
+        ffn_hc_pack,
         layer.ffn_hc.dyn_norm.eps,
         layer.ffn_hc.sinkhorn_iters,
         layer.ffn_norm.weight,
@@ -288,6 +306,21 @@ class RDT4QuantCPU(nn.Module):
         self.head = nn.Linear(self.cfg.d_model, len(config["horizons_minutes"]) * 3)
         self.n_horizons = len(config["horizons_minutes"])
         install_cpu_layers(self)
+
+    def _clear_native_parameter_packs(self) -> None:
+        self.recurrent.__dict__.pop("_montlok_stage1_parameter_pack", None)
+        for layer in self.recurrent.stage2:
+            layer.__dict__.pop("_montlok_stage2_parameter_packs", None)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        self._clear_native_parameter_packs()
+        return result
+
+    def train(self, mode: bool = True):
+        result = super().train(mode)
+        self._clear_native_parameter_packs()
+        return result
 
     def encode(self, inputs: torch.Tensor, depth: int):
         projected = cpu_linear(inputs.float(), self.projection.weight, self.projection.bias)

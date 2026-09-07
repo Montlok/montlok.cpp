@@ -73,13 +73,14 @@ torch::Tensor linear_dispatch(
         return at::linear(input, weight, bias);
     }
     static const auto op = c10::Dispatcher::singleton().findSchemaOrThrow("mkldnn::_linear_pointwise", "");
+    static const auto no_scalars = c10::List<std::optional<at::Scalar>>();
     c10::Stack stack;
     stack.reserve(6);
     stack.emplace_back(input);
     stack.emplace_back(weight);
     stack.emplace_back(bias.has_value() ? c10::IValue(*bias) : c10::IValue());
     stack.emplace_back(std::string("none"));
-    stack.emplace_back(c10::List<std::optional<at::Scalar>>());
+    stack.emplace_back(no_scalars);
     stack.emplace_back(c10::IValue());
     op.callBoxed(&stack);
     TORCH_INTERNAL_ASSERT(stack.size() == 1, "oneDNN linear returned an invalid boxed stack");
@@ -96,11 +97,11 @@ torch::Tensor linear_dispatch(
 // Small problems are run inline: a fork/join costs tens of microseconds on a
 // 16-32 thread pool, more than the arithmetic of a 480-token RMSNorm.
 // `work_per_item` is an estimate in scalar float operations; the threshold is
-// configurable with MONTLOK_SERIAL_WORK (default 100000).
+// configurable with MONTLOK_SERIAL_WORK (default 150000).
 int64_t serial_work_threshold() {
     static const int64_t threshold = [] {
         const char* env = std::getenv("MONTLOK_SERIAL_WORK");
-        return env ? static_cast<int64_t>(std::atoll(env)) : int64_t{100000};
+        return env ? static_cast<int64_t>(std::atoll(env)) : int64_t{150000};
     }();
     return threshold;
 }
@@ -269,7 +270,7 @@ torch::Tensor mamba3_siso_forward(
     double c_eps,
     double a_floor) {
     require_f32_cpu(projected, "projected");
-    const bool gate_logits = gate.numel() == 0;
+    const bool gate_logits = !gate.defined() || gate.numel() == 0;
     if (!gate_logits) {
         require_f32_cpu(gate, "gate");
     }
@@ -309,11 +310,36 @@ torch::Tensor mamba3_siso_forward(
     const torch::Tensor skip_dense = dense_parameter(skip, nheads, "D");
 
     const auto options = projected.options();
-    auto q = torch::empty({batch, length, nheads, d_state}, options);
-    auto k = torch::empty({batch, length, nheads, d_state}, options);
-    auto coefficients = torch::empty({3, batch, length, nheads}, options);
-    auto angle_term = torch::empty({batch, length, nheads, std::max<int64_t>(num_rope_angles, 1)}, options);
-    auto cumulative = torch::empty({batch, nheads, std::max<int64_t>(num_rope_angles, 1), length}, options);
+    torch::Tensor q;
+    torch::Tensor k;
+    torch::Tensor coefficients;
+    torch::Tensor angle_term;
+    torch::Tensor cumulative;
+    const int64_t angle_width = std::max<int64_t>(num_rope_angles, 1);
+    const char* slab_env = std::getenv("MONTLOK_MAMBA_SLAB");
+    if (slab_env == nullptr || std::string_view(slab_env) != "0") {
+        const int64_t qk_values = batch * length * nheads * d_state;
+        const int64_t coefficient_values = 3 * batch * length * nheads;
+        const int64_t angle_values = batch * length * nheads * angle_width;
+        auto storage = torch::empty({2 * qk_values + coefficient_values + 2 * angle_values}, options);
+        int64_t offset = 0;
+        auto take = [&](int64_t count) {
+            auto value = storage.narrow(0, offset, count);
+            offset += count;
+            return value;
+        };
+        q = take(qk_values).view({batch, length, nheads, d_state});
+        k = take(qk_values).view({batch, length, nheads, d_state});
+        coefficients = take(coefficient_values).view({3, batch, length, nheads});
+        angle_term = take(angle_values).view({batch, length, nheads, angle_width});
+        cumulative = take(angle_values).view({batch, nheads, angle_width, length});
+    } else {
+        q = torch::empty({batch, length, nheads, d_state}, options);
+        k = torch::empty({batch, length, nheads, d_state}, options);
+        coefficients = torch::empty({3, batch, length, nheads}, options);
+        angle_term = torch::empty({batch, length, nheads, angle_width}, options);
+        cumulative = torch::empty({batch, nheads, angle_width, length}, options);
+    }
     auto output = torch::empty({batch, length, d_inner}, options);
 
     prep.proj = projected.data_ptr<float>();
@@ -407,7 +433,7 @@ torch::Tensor mamba3_siso_layer(
     double c_eps,
     double a_floor) {
     auto projected = linear_dispatch(inputs, in_weight);
-    auto gate = torch::empty({0}, inputs.options());
+    torch::Tensor gate;
     auto output = mamba3_siso_forward(projected, gate, b_bias, c_bias, b_norm_w, c_norm_w, dt_bias, skip, d_state,
                                       ngroups, nheads, headdim, num_rope_angles, b_eps, c_eps, a_floor);
     return linear_dispatch(output, out_weight);
@@ -475,7 +501,8 @@ MhcPrepareOutputs mhc_prepare_plan(
     int64_t sinkhorn_iters,
     const std::optional<torch::Tensor>& agg_norm_w,
     double agg_norm_eps,
-    std::vector<torch::Tensor>& keep_alive) {
+    std::vector<torch::Tensor>& keep_alive,
+    const MhcPrepareOutputs* workspace = nullptr) {
     const int64_t n = view.n;
     const int64_t d = view.d;
     TORCH_CHECK(sinkhorn_iters >= 0, "sinkhorn_iters must be non-negative");
@@ -495,13 +522,26 @@ MhcPrepareOutputs mhc_prepare_plan(
         return static_cast<double>(value.data_ptr<float>()[0]);
     };
 
-    const auto options = torch::dtype(torch::kFloat32).device(torch::kCPU);
-    MhcPrepareOutputs outputs{
-        torch::empty({view.batch, view.length, d}, options),
-        torch::empty({view.batch, view.length, n}, options),
-        torch::empty({view.batch, view.length, n}, options),
-        torch::empty({view.batch, view.length, n, n}, options),
-    };
+    MhcPrepareOutputs outputs;
+    if (workspace == nullptr) {
+        const auto options = torch::dtype(torch::kFloat32).device(torch::kCPU);
+        outputs = {
+            torch::empty({view.batch, view.length, d}, options),
+            torch::empty({view.batch, view.length, n}, options),
+            torch::empty({view.batch, view.length, n}, options),
+            torch::empty({view.batch, view.length, n, n}, options),
+        };
+    } else {
+        outputs = *workspace;
+        auto require_output = [](const torch::Tensor& value, torch::IntArrayRef shape, const char* name) {
+            require_f32_cpu(value, name);
+            TORCH_CHECK(value.sizes() == shape && value.is_contiguous(), name, " has an invalid workspace shape");
+        };
+        require_output(outputs.agg, {view.batch, view.length, d}, "agg workspace");
+        require_output(outputs.pre, {view.batch, view.length, n}, "pre workspace");
+        require_output(outputs.post, {view.batch, view.length, n}, "post workspace");
+        require_output(outputs.res, {view.batch, view.length, n, n}, "res workspace");
+    }
 
     plan.norm_w = keep_alive[parameter_base].data_ptr<float>();
     plan.proj_w = proj_w.data_ptr<double>();
@@ -732,6 +772,69 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mhc_combi
     }, mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
        outputs.agg);
     return std::make_tuple(outputs.agg, outputs.pre, outputs.post, outputs.res);
+}
+
+// Stage-2-only transition which also reuses the coefficient/output workspace.
+// combine consumes post/res for each token block before prepare overwrites the
+// same block, so the old and new coefficient tensors can safely alias.
+void mhc_combine_prepare_reuse(
+    torch::Tensor& streams,
+    torch::Tensor& agg,
+    torch::Tensor& pre,
+    torch::Tensor& post,
+    torch::Tensor& res,
+    const torch::Tensor& out,
+    const torch::Tensor& norm_w,
+    double eps,
+    const torch::Tensor& proj_w,
+    const torch::Tensor& pre_bias,
+    const torch::Tensor& post_bias,
+    const torch::Tensor& res_bias,
+    const torch::Tensor& pre_alpha,
+    const torch::Tensor& post_alpha,
+    const torch::Tensor& res_alpha,
+    int64_t sinkhorn_iters,
+    const std::optional<torch::Tensor>& agg_norm_w,
+    double agg_norm_eps,
+    bool reuse_streams) {
+    const StreamsView view = streams_view(streams, res.dim() == 4 ? res.size(-1) : 0, "streams");
+    if (reuse_streams) {
+        TORCH_CHECK(streams.dim() == 4 && view.stream_stride == view.d && view.n <= 8,
+                    "in-place mHC requires contiguous materialised streams with at most eight lanes");
+    }
+    montlok::MhcCombinePlan combine = mhc_combine_plan(view, res, post, out);
+    torch::Tensor next_streams;
+    if (reuse_streams) {
+        combine.new_streams = streams.data_ptr<float>();
+    } else {
+        next_streams = torch::empty({view.batch, view.length, view.n, view.d}, streams.options());
+        combine.new_streams = next_streams.data_ptr<float>();
+    }
+
+    std::vector<torch::Tensor> keep_alive;
+    keep_alive.reserve(5);
+    montlok::MhcPlan prepare{};
+    const MhcPrepareOutputs workspace{agg, pre, post, res};
+    MhcPrepareOutputs outputs = mhc_prepare_plan(prepare, view, norm_w, eps, proj_w, pre_bias, post_bias, res_bias,
+                                                 pre_alpha, post_alpha, res_alpha, sinkhorn_iters, agg_norm_w,
+                                                 agg_norm_eps, keep_alive, &workspace);
+    prepare.streams = combine.new_streams;
+    prepare.stream_stride = view.d;
+    prepare.token_stride = view.n * view.d;
+
+    const int64_t scratch_doubles = montlok::mhc_scratch_doubles(prepare);
+    parallel_items(prepare.tokens, montlok::kMhcTokenBlock, [&](int64_t begin, int64_t end) {
+        std::vector<double> scratch(static_cast<size_t>(scratch_doubles));
+        if (reuse_streams) {
+            montlok::mhc_combine_prepare_inplace_range(combine, prepare, begin, end, scratch.data());
+        } else {
+            montlok::mhc_combine_prepare_range(combine, prepare, begin, end, scratch.data());
+        }
+    }, mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
+       outputs.agg);
+    if (!reuse_streams) {
+        streams = std::move(next_streams);
+    }
 }
 
 // RMSNorm / GroupedRMSNorm (Model/layers/rmsnorm.py) over the last dimension.
@@ -1100,6 +1203,15 @@ torch::Tensor stage2_tail_forward(
                                            next_hc[3], next_hc[4], next_hc[5], next_hc[6], next_hc[7], next_iters,
                                            output_norm_weight, output_norm_eps);
     };
+    auto reuse_coefficients = [&](torch::Tensor& streams, torch::Tensor& agg, torch::Tensor& pre,
+                                  torch::Tensor& post, torch::Tensor& res, const torch::Tensor& out,
+                                  const std::vector<torch::Tensor>& next_hc, double next_eps,
+                                  int64_t next_iters, const torch::Tensor& output_norm_weight,
+                                  double output_norm_eps, bool reuse_streams) {
+        mhc_combine_prepare_reuse(streams, agg, pre, post, res, out, next_hc[0], next_eps, next_hc[1],
+                                  next_hc[2], next_hc[3], next_hc[4], next_hc[5], next_hc[6], next_hc[7],
+                                  next_iters, output_norm_weight, output_norm_eps, reuse_streams);
+    };
     auto run_mla = [&](const torch::Tensor& input, int64_t n_last) {
         const torch::Tensor& projection = n_last == input.size(1) ? mla[0] : mla[1];
         return mla_forward(input, projection, mla[2], mla[3], mla[4], kv_norm_eps, mla[5], mla[6], mla[7], mla[8],
@@ -1110,10 +1222,14 @@ torch::Tensor stage2_tail_forward(
                          attn_norm_eps);
     torch::Tensor streams = backbone;
     torch::Tensor agg = std::get<0>(first);
+    torch::Tensor pre = std::get<1>(first);
     torch::Tensor post = std::get<2>(first);
     torch::Tensor res = std::get<3>(first);
     const char* inplace_env = std::getenv("MONTLOK_STAGE2_INPLACE");
     const bool use_inplace = n_streams <= 8 && (inplace_env == nullptr || std::string_view(inplace_env) != "0");
+    const char* coefficient_env = std::getenv("MONTLOK_STAGE2_REUSE_COEFF");
+    const bool reuse_coefficient_workspace =
+        coefficient_env == nullptr || std::string_view(coefficient_env) != "0";
 
     const std::optional<torch::Tensor> ffn_in_bias = ffn[1].numel() ? std::optional<torch::Tensor>(ffn[1]) : std::nullopt;
     const std::optional<torch::Tensor> ffn_out_bias = ffn[3].numel() ? std::optional<torch::Tensor>(ffn[3]) : std::nullopt;
@@ -1133,6 +1249,14 @@ torch::Tensor stage2_tail_forward(
         }
 
         auto attn_out = run_mla(agg, agg.size(1));
+        if (reuse_coefficient_workspace) {
+            reuse_coefficients(streams, agg, pre, post, res, attn_out, ffn_hc, ffn_hc_eps, ffn_sinkhorn_iters,
+                               ffn_norm_weight, ffn_norm_eps, use_inplace && streams.dim() == 4);
+            auto ffn_out = swiglu_mlp(agg, ffn[0], ffn_in_bias, ffn[2], ffn_out_bias);
+            reuse_coefficients(streams, agg, pre, post, res, ffn_out, attn_hc, attn_hc_eps,
+                               attn_sinkhorn_iters, attn_norm_weight, attn_norm_eps, use_inplace);
+            continue;
+        }
         torch::Tensor ffn_agg;
         torch::Tensor ffn_post;
         torch::Tensor ffn_res;

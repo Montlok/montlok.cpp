@@ -100,6 +100,9 @@ def main() -> None:
                 "MONTLOK_CPP_NATIVE_STAGE1",
                 "MONTLOK_CPP_NATIVE_STAGE2",
                 "MONTLOK_STAGE2_INPLACE",
+                "MONTLOK_STAGE2_REUSE_COEFF",
+                "MONTLOK_MAMBA_SLAB",
+                "MONTLOK_CACHE_PARAMETER_PACKS",
                 "MONTLOK_OPENMP",
                 "MONTLOK_SERIAL_WORK",
             )

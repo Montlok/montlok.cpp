@@ -59,6 +59,9 @@ BACKEND_VARS = (
     "MONTLOK_CPP_NATIVE_STAGE1",
     "MONTLOK_CPP_NATIVE_STAGE2",
     "MONTLOK_STAGE2_INPLACE",
+    "MONTLOK_STAGE2_REUSE_COEFF",
+    "MONTLOK_MAMBA_SLAB",
+    "MONTLOK_CACHE_PARAMETER_PACKS",
 )
 
 
@@ -434,12 +437,41 @@ def test_full_model() -> None:
             applications = [layer for _ in range(4) for layer in model.recurrent.stage2]
             fused_full_hidden = fused_stage2(applications, backbone)
             fused_tail_hidden = fused_stage2(applications, backbone, 1)
+    caches_ready = (
+        "_montlok_stage1_parameter_pack" in model.recurrent.__dict__
+        and "_montlok_stage2_parameter_packs" in model.recurrent.stage2[0].__dict__
+    )
+    print(f"full model native parameter packs cached{' ok' if caches_ready else ' FAIL'}")
+    if not caches_ready:
+        FAILURES.append("full model native parameter packs cached")
+    model.eval()
+    caches_cleared = (
+        "_montlok_stage1_parameter_pack" not in model.recurrent.__dict__
+        and "_montlok_stage2_parameter_packs" not in model.recurrent.stage2[0].__dict__
+    )
+    print(f"full model eval invalidates parameter packs{' ok' if caches_cleared else ' FAIL'}")
+    if not caches_cleared:
+        FAILURES.append("full model eval invalidates parameter packs")
     with backend(MONTLOK_CPP="1", MONTLOK_STAGE2_INPLACE="0"):
         q_copy, rms_copy, h_copy, s_copy, stock_rms_copy = run()
+    with backend(MONTLOK_CPP="1", MONTLOK_STAGE2_INPLACE="0", MONTLOK_STAGE2_REUSE_COEFF="0"):
+        q_legacy, rms_legacy, h_legacy, s_legacy, stock_rms_legacy = run()
+    with backend(MONTLOK_CPP="1", MONTLOK_MAMBA_SLAB="0"):
+        q_mamba_alloc, rms_mamba_alloc, h_mamba_alloc, s_mamba_alloc, stock_rms_mamba_alloc = run()
+    with backend(MONTLOK_CPP="1", MONTLOK_CACHE_PARAMETER_PACKS="0"):
+        q_uncached, rms_uncached, h_uncached, s_uncached, stock_rms_uncached = run()
     with backend(MONTLOK_CPP="1", MONTLOK_CPP_NATIVE_STAGE1="0", MONTLOK_CPP_NATIVE_STAGE2="0"):
         q_python, rms_python, _h_python, s_python, stock_rms_python = run()
     with backend(MONTLOK_CPP="1", MONTLOK_CPP_MHC="0", MONTLOK_CPP_LAYERS="0"):
         q_mamba, _rms_mamba, h_mamba, _s_mamba, _stock_rms_mamba = run()
+    model.load_state_dict(model.state_dict(), strict=True)
+    load_cleared = (
+        "_montlok_stage1_parameter_pack" not in model.recurrent.__dict__
+        and "_montlok_stage2_parameter_packs" not in model.recurrent.stage2[0].__dict__
+    )
+    print(f"full model load invalidates parameter packs{' ok' if load_cleared else ' FAIL'}")
+    if not load_cleared:
+        FAILURES.append("full model load invalidates parameter packs")
     hidden_tol = 1e-4 * (1.0 + float(h_ref.abs().max()))
     quantile_tol = 1e-5 * (1.0 + float(q_ref.abs().max()))
     stock_tol = 1e-5 * (1.0 + float(s_ref.abs().max()))
@@ -452,6 +484,21 @@ def test_full_model() -> None:
     report("full model in-place vs copying equity tail", s_tail, s_copy, 0.0)
     report("full model in-place vs copying hidden RMS", rms_tail, rms_copy, 0.0)
     report("full model in-place vs copying stock RMS", stock_rms_tail, stock_rms_copy, 0.0)
+    report("full model reused vs allocated coefficients", q_tail, q_legacy, 0.0)
+    report("full model reused vs allocated hidden states", h_tail_encode, h_legacy, 0.0)
+    report("full model reused vs allocated equity tail", s_tail, s_legacy, 0.0)
+    report("full model reused vs allocated hidden RMS", rms_tail, rms_legacy, 0.0)
+    report("full model reused vs allocated stock RMS", stock_rms_tail, stock_rms_legacy, 0.0)
+    report("full model Mamba slab vs separate allocations", q_tail, q_mamba_alloc, 0.0)
+    report("full model Mamba slab vs allocated hidden states", h_tail_encode, h_mamba_alloc, 0.0)
+    report("full model Mamba slab vs allocated equity tail", s_tail, s_mamba_alloc, 0.0)
+    report("full model Mamba slab vs allocated hidden RMS", rms_tail, rms_mamba_alloc, 0.0)
+    report("full model Mamba slab vs allocated stock RMS", stock_rms_tail, stock_rms_mamba_alloc, 0.0)
+    report("full model cached vs rebuilt parameter packs", q_tail, q_uncached, 0.0)
+    report("full model cached vs rebuilt hidden states", h_tail_encode, h_uncached, 0.0)
+    report("full model cached vs rebuilt equity tail", s_tail, s_uncached, 0.0)
+    report("full model cached vs rebuilt hidden RMS", rms_tail, rms_uncached, 0.0)
+    report("full model cached vs rebuilt stock RMS", stock_rms_tail, stock_rms_uncached, 0.0)
     report("full model crypto tail vs full C++", q_tail, q_full, quantile_tol)
     report("full model equity quantiles (full fused ops)", s_full, s_ref, stock_tol)
     report("full model equity quantiles (tail fused chain)", s_tail, s_ref, stock_tol)

@@ -288,7 +288,12 @@ inline v8f gate_silu8(const v8f& y, const v8f& z) noexcept {
 // polynomials to r^13 / r^14 leave < 1e-13 truncation error: after rounding to
 // float32 each result is within 0.5 ulp (+ epsilon) of the true value, which is
 // at least as accurate as libm's sincosf and ATen's Sleef _u10 kernels.
-inline void sincos4_d(const v4d& x, v4d* sine, v4d* cosine) noexcept {
+struct SinCos4 {
+    v4d sine;
+    v4d cosine;
+};
+
+inline SinCos4 sincos4_d(const v4d& x) noexcept {
     const v4d magic = splat4d(6755399441055744.0);  // 1.5 * 2^52: adds round-to-nearest for |y| < 2^51
     const v4d kf = (x * splat4d(0.63661977236758134308) + magic) - magic;
     const v4d r = (x - kf * splat4d(1.5707963267341256)) - kf * splat4d(6.0771005065061922e-11);
@@ -308,6 +313,7 @@ inline void sincos4_d(const v4d& x, v4d* sine, v4d* cosine) noexcept {
     c = c * r2 + splat4d(1.0 / 24.0);
     c = c * r2 - splat4d(0.5);
     c = c * r2 + splat4d(1.0);
+    SinCos4 result{splat4d(0.0), splat4d(0.0)};
     for (int lane = 0; lane < 4; ++lane) {
         const int64_t quadrant = static_cast<int64_t>(kf[lane]) & 3;
         const double sv = s[lane];
@@ -318,9 +324,10 @@ inline void sincos4_d(const v4d& x, v4d* sine, v4d* cosine) noexcept {
             so = -so;
             co = -co;
         }
-        (*sine)[lane] = so;
-        (*cosine)[lane] = co;
+        result.sine[lane] = so;
+        result.cosine[lane] = co;
     }
+    return result;
 }
 
 // One (batch, head, headdim block) work item. NV is the number of 8-lane
@@ -664,12 +671,10 @@ inline void sincos_angles(const float* angles, int count, float* sines, float* c
     for (int i = 0; i < count; ++i) {
         x[i] = static_cast<double>(angles[i]);
     }
-    v4d s;
-    v4d c;
-    sincos4_d(x, &s, &c);
+    const SinCos4 result = sincos4_d(x);
     for (int i = 0; i < count; ++i) {
-        sines[i] = static_cast<float>(s[i]);
-        cosines[i] = static_cast<float>(c[i]);
+        sines[i] = static_cast<float>(result.sine[i]);
+        cosines[i] = static_cast<float>(result.cosine[i]);
     }
 #else
     for (int i = 0; i < count; ++i) {
