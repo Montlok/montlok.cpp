@@ -12,7 +12,7 @@ from pathlib import Path
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-from montlok_loader import HEADERS, PREBUILT_MODULE, SOURCES, compile_flags
+from montlok_loader import HEADERS, PREBUILT_MODULE, SOURCES, compile_flags, openmp_flags
 
 
 root = Path(__file__).resolve().parent
@@ -25,6 +25,7 @@ setup(
             depends=[str(path) for path in HEADERS],
             include_dirs=[str(root)],
             extra_compile_args=compile_flags(),
+            extra_link_args=openmp_flags(),
         )
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=False)},

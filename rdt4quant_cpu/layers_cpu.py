@@ -84,7 +84,13 @@ class SwiGLUCPU(SwiGLU):
             return super().forward(x)
         if x.shape[-1] != self.d_model:
             raise ValueError(f"expected last dim {self.d_model}, got {x.shape[-1]}")
-        return self.w_down(_ext().swiglu(self.w_in(x)))
+        return _ext().swiglu_mlp(
+            x,
+            self.w_in.weight,
+            self.w_in.bias,
+            self.w_down.weight,
+            self.w_down.bias,
+        )
 
 
 _SWAPS = {

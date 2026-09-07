@@ -44,6 +44,8 @@ struct MhcPlan {
     int64_t d;
     int sinkhorn_iters;
     float* agg;   // [tokens, d]   sum_i pre_i * streams_i
+    const float* agg_norm_w;  // optional [d], normalizes agg in place for the wrapped layer
+    double agg_norm_eps;
     float* pre;   // [tokens, n]   sigmoid(pre logits)
     float* post;  // [tokens, n]   2 * sigmoid(post logits)
     float* res;   // [tokens, n, n] doubly stochastic mixing matrix
@@ -197,6 +199,42 @@ inline void sinkhorn_block(double* __restrict m, double* __restrict sums, int64_
 #endif
 }
 
+// RMS-normalize one freshly produced aggregate in place. Keeping this beside
+// mhc_prepare_block lets the aggregate stay hot in L1 and removes a separate
+// PyTorch/C++ operator plus one full read pass before the wrapped layer.
+inline void mhc_agg_norm_inplace(float* __restrict x, const float* __restrict w, double eps, int64_t d) noexcept {
+    double sumsq = 0.0;
+    int64_t k = 0;
+#ifdef MONTLOK_VECTOR_EXT
+    {
+        v4d acc0 = splat4d(0.0);
+        v4d acc1 = splat4d(0.0);
+        for (; k + 8 <= d; k += 8) {
+            const v4d a = load4f_as_d(x + k);
+            const v4d b = load4f_as_d(x + k + 4);
+            acc0 += a * a;
+            acc1 += b * b;
+        }
+        sumsq = hsum4d(acc0 + acc1);
+    }
+#endif
+    for (; k < d; ++k) {
+        const double value = static_cast<double>(x[k]);
+        sumsq += value * value;
+    }
+    const double scale = 1.0 / std::sqrt(sumsq / static_cast<double>(d) + eps);
+    k = 0;
+#ifdef MONTLOK_VECTOR_EXT
+    const v4d vscale = splat4d(scale);
+    for (; k + 4 <= d; k += 4) {
+        store4d_as_f(x + k, load4f_as_d(x + k) * vscale * load4f_as_d(w + k));
+    }
+#endif
+    for (; k < d; ++k) {
+        x[k] = static_cast<float>(static_cast<double>(x[k]) * scale * static_cast<double>(w[k]));
+    }
+}
+
 // Coefficients and aggregated input for `count` (<= kMhcTokenBlock)
 // consecutive tokens starting at token0. Padding lanes carry zeros through the
 // shared dot products and Sinkhorn so they stay finite; nothing is written for them.
@@ -311,6 +349,9 @@ inline void mhc_prepare_block(const MhcPlan& p, int64_t token0, int64_t count, d
                 acc += static_cast<double>(pre[i]) * static_cast<double>(streams[i * sd + k]);
             }
             agg[k] = static_cast<float>(acc);
+        }
+        if (p.agg_norm_w != nullptr) {
+            mhc_agg_norm_inplace(agg, p.agg_norm_w, p.agg_norm_eps, d);
         }
     }
 

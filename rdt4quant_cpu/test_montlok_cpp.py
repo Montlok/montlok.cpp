@@ -41,6 +41,7 @@ from Model.layers.mla import MLA  # noqa: E402
 from Model.layers.rmsnorm import GroupedRMSNorm, RMSNorm  # noqa: E402
 from Model.layers.swiglu import SwiGLU  # noqa: E402
 
+from linear_cpu import cpu_linear  # noqa: E402
 from mamba3_cpu import Mamba3CPUReference  # noqa: E402
 from mhc_cpu import ManifoldHyperConnectionCPU  # noqa: E402
 from mla_cpu import MLACPU  # noqa: E402
@@ -53,6 +54,10 @@ BACKEND_VARS = (
     "MONTLOK_CPP_MHC",
     "MONTLOK_CPP_LAYERS",
     "MONTLOK_CPP_TAIL",
+    "MONTLOK_CPP_DNNL",
+    "MONTLOK_DNNL_MIN_ROWS",
+    "MONTLOK_CPP_NATIVE_STAGE1",
+    "MONTLOK_CPP_NATIVE_STAGE2",
 )
 
 
@@ -313,6 +318,26 @@ def test_cpu_layers() -> None:
         report(name + " MONTLOK_CPP_LAYERS=0 passthrough", disabled, expected, 0.0)
 
 
+def test_cpu_linear() -> None:
+    torch.manual_seed(14)
+    for shape, output_dim, bias_enabled in (
+        ((480, 256), 1536, True),
+        ((2, 37, 64), 100, False),
+    ):
+        x = torch.randn(*shape)
+        weight = torch.randn(output_dim, shape[-1]) / shape[-1] ** 0.5
+        bias = torch.randn(output_dim) if bias_enabled else None
+        expected = torch.nn.functional.linear(x, weight, bias)
+        with torch.inference_mode():
+            with backend(MONTLOK_CPP="1"):
+                actual = cpu_linear(x, weight, bias)
+            with backend(MONTLOK_CPP="1", MONTLOK_CPP_DNNL="0"):
+                disabled = cpu_linear(x, weight, bias)
+        name = f"CPU linear {tuple(shape)}->{output_dim} bias{int(bias_enabled)}"
+        report(name, actual, expected, 8e-6 * (1.0 + float(expected.abs().max())))
+        report(name + " oneDNN disabled", disabled, expected, 0.0)
+
+
 def load_config() -> dict:
     return json.loads((HERE.parent / "rdt4quant" / "config.json").read_text())
 
@@ -366,7 +391,7 @@ def test_mla() -> None:
 
 
 def test_full_model() -> None:
-    from model_cpu import MultiAssetRDTCPU, fused_stage2
+    from model_cpu import MultiAssetRDTCPU, fused_stage2, native_stage1
 
     config = load_config()
     torch.manual_seed(0)
@@ -404,9 +429,12 @@ def test_full_model() -> None:
                 attn_mask=None,
                 causal=True,
             )
+            native_backbone = native_stage1(model.recurrent, embedded)
             applications = [layer for _ in range(4) for layer in model.recurrent.stage2]
             fused_full_hidden = fused_stage2(applications, backbone)
             fused_tail_hidden = fused_stage2(applications, backbone, 1)
+    with backend(MONTLOK_CPP="1", MONTLOK_CPP_NATIVE_STAGE1="0", MONTLOK_CPP_NATIVE_STAGE2="0"):
+        q_python, rms_python, _h_python, s_python, stock_rms_python = run()
     with backend(MONTLOK_CPP="1", MONTLOK_CPP_MHC="0", MONTLOK_CPP_LAYERS="0"):
         q_mamba, _rms_mamba, h_mamba, _s_mamba, _stock_rms_mamba = run()
     hidden_tol = 1e-4 * (1.0 + float(h_ref.abs().max()))
@@ -415,9 +443,12 @@ def test_full_model() -> None:
     report("full model hidden states (all fused ops)", h_full, h_ref, hidden_tol)
     report("full model crypto quantiles (full fused ops)", q_full, q_ref, quantile_tol)
     report("full model crypto quantiles (tail fused chain)", q_tail, q_ref, quantile_tol)
+    report("full model native vs Python tail chain", q_tail, q_python, quantile_tol)
     report("full model crypto tail vs full C++", q_tail, q_full, quantile_tol)
     report("full model equity quantiles (full fused ops)", s_full, s_ref, stock_tol)
     report("full model equity quantiles (tail fused chain)", s_tail, s_ref, stock_tol)
+    report("full model native vs Python equity tail", s_tail, s_python, stock_tol)
+    report("full model native Stage-1", native_backbone, backbone, hidden_tol)
     report(
         "full model full hidden fused chain",
         fused_full_hidden,
@@ -437,6 +468,8 @@ def test_full_model() -> None:
         h_tail_encode[:, -1:].detach().float().square().mean().sqrt(),
         hidden_tol,
     )
+    report("full model native vs Python tail RMS", rms_tail, rms_python, hidden_tol)
+    report("full model native vs Python stock tail RMS", stock_rms_tail, stock_rms_python, hidden_tol)
     report("full model stock full hidden RMS", stock_rms_full, stock_rms_ref, hidden_tol)
     if not torch.isfinite(stock_rms_tail):
         FAILURES.append("full model stock tail hidden RMS")
@@ -461,6 +494,7 @@ def main() -> int:
         test_mhc,
         test_mhc_chain,
         test_cpu_layers,
+        test_cpu_linear,
         test_mla,
         test_full_model,
     ):

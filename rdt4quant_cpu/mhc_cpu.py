@@ -85,7 +85,7 @@ class ManifoldHyperConnectionCPU(ManifoldHyperConnection):
             self.sinkhorn_iters,
         )
 
-    def _prepare(self, streams: torch.Tensor, *, allow_broadcast: bool = False):
+    def _prepare(self, streams: torch.Tensor, *, allow_broadcast: bool = False, output_norm=None):
         from montlok_loader import load_montlok
 
         if streams.ndim == 3:
@@ -99,7 +99,10 @@ class ManifoldHyperConnectionCPU(ManifoldHyperConnection):
             n_streams = 0
         streams = streams.contiguous()
         ext = load_montlok()
-        return streams, ext.mhc_prepare(streams, *self._prepare_args(), n_streams)
+        args = (streams, *self._prepare_args(), n_streams)
+        if output_norm is not None:
+            args += (output_norm.weight, output_norm.eps)
+        return streams, ext.mhc_prepare(*args)
 
     @staticmethod
     def _prepared_parts(prepared):
@@ -118,20 +121,23 @@ class ManifoldHyperConnectionCPU(ManifoldHyperConnection):
         post, res = self._prepared_parts(prepared)
         return load_montlok().mhc_combine_collapse(streams, res, post, out.contiguous())
 
-    def _combine_prepare(self, streams: torch.Tensor, prepared, out: torch.Tensor, next_hc):
+    def _combine_prepare(self, streams: torch.Tensor, prepared, out: torch.Tensor, next_hc, output_norm=None):
         """Write this residual and prepare ``next_hc`` in one C++ traversal."""
         from montlok_loader import load_montlok
 
         if not isinstance(next_hc, ManifoldHyperConnectionCPU):
             raise TypeError("next_hc must be a ManifoldHyperConnectionCPU")
         post, res = self._prepared_parts(prepared)
-        values = load_montlok().mhc_combine_prepare(
+        args = (
             streams,
             res,
             post,
             out.contiguous(),
             *next_hc._prepare_args(),
         )
+        if output_norm is not None:
+            args += (output_norm.weight, output_norm.eps)
+        values = load_montlok().mhc_combine_prepare(*args)
         new_streams, agg, pre, next_post, next_res = values
         return new_streams, (agg, pre, next_post, next_res)
 

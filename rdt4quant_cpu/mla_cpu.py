@@ -38,6 +38,7 @@ if str(NATIVE) not in sys.path:
 
 from Model.layers.mla import MLA  # noqa: E402
 
+from linear_cpu import cpu_linear  # noqa: E402
 from mamba3_cpu import cpp_backend  # noqa: E402
 
 
@@ -137,8 +138,9 @@ class MLACPU(MLA):
 
     def _project_q_rows(self, x_rows: torch.Tensor) -> torch.Tensor:
         if self.q_lora_rank > 0:
-            return self.q_up(self.q_norm(self.q_down(x_rows)))
-        return self.q_proj(x_rows)
+            down = cpu_linear(x_rows, self.q_down.weight, self.q_down.bias)
+            return cpu_linear(self.q_norm(down), self.q_up.weight, self.q_up.bias)
+        return cpu_linear(x_rows, self.q_proj.weight, self.q_proj.bias)
 
     def _attend(self, x: torch.Tensor, n_last: int, causal: bool, pos_offset: int) -> torch.Tensor:
         bsz, seq_len, dim = x.shape
@@ -149,7 +151,30 @@ class MLACPU(MLA):
 
         ext = load_montlok()
         fuse_q = self.q_lora_rank == 0 and n_last == seq_len
-        projected = F.linear(x, self._in_proj_weight(fuse_q))
+        cos, sin = self._rope_tables(seq_len, pos_offset, x.device)
+        if self.q_lora_rank == 0 and n_last in (1, seq_len):
+            q_weight = self.q_proj.weight if n_last == 1 else x.new_empty(0)
+            return ext.mla_forward(
+                x,
+                self._in_proj_weight(fuse_q),
+                q_weight,
+                self.kv_norm.weight,
+                self.kv_norm.bias,
+                self.kv_norm.eps,
+                self.kv_up.weight,
+                self.o_proj.weight,
+                cos,
+                sin,
+                self.n_heads,
+                self.head_dim,
+                self.nope_dim,
+                self.kv_lora_rank,
+                n_last,
+                causal,
+                self.scale,
+            )
+
+        projected = cpu_linear(x, self._in_proj_weight(fuse_q))
         q_width = self.n_heads * self.head_dim if fuse_q else 0
         if fuse_q:
             q = projected[..., :q_width]
@@ -158,9 +183,8 @@ class MLACPU(MLA):
         q = q.view(bsz, n_last, self.n_heads, self.head_dim)
         kv_latent = projected[..., q_width : q_width + self.kv_lora_rank]
         k_rope = projected[..., q_width + self.kv_lora_rank :]
-        kv = self.kv_up(self.kv_norm(kv_latent))
+        kv = cpu_linear(self.kv_norm(kv_latent), self.kv_up.weight, self.kv_up.bias)
         kv = kv.view(bsz, seq_len, self.n_heads, self.nope_dim + self.head_dim)
-        cos, sin = self._rope_tables(seq_len, pos_offset, x.device)
         # Rotates q's rope lanes in place (q is a fresh projection output).
         k = ext.mla_rope_qk(q, kv, k_rope, cos, sin, self.nope_dim)
         v = kv[..., self.nope_dim :]
@@ -188,4 +212,4 @@ class MLACPU(MLA):
             scale=self.scale,
         )
         out = out.transpose(1, 2).reshape(bsz, n_last, self.n_heads * self.head_dim)
-        return self.o_proj(out)
+        return cpu_linear(out, self.o_proj.weight, self.o_proj.bias)

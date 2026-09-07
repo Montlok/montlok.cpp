@@ -89,7 +89,20 @@ def main() -> None:
         "flush_denormal": not args.no_flush_denormal,
         "montlok_backend": cpp_backend(),
         "montlok_build": montlok_build,
-        "montlok_env": {name: os.environ.get(name) for name in ("MONTLOK_CPP_FUSED", "MONTLOK_CPP_MHC", "MONTLOK_CPP_LAYERS", "MONTLOK_SERIAL_WORK")},
+        "montlok_env": {
+            name: os.environ.get(name)
+            for name in (
+                "MONTLOK_CPP_FUSED",
+                "MONTLOK_CPP_MHC",
+                "MONTLOK_CPP_LAYERS",
+                "MONTLOK_CPP_DNNL",
+                "MONTLOK_DNNL_MIN_ROWS",
+                "MONTLOK_CPP_NATIVE_STAGE1",
+                "MONTLOK_CPP_NATIVE_STAGE2",
+                "MONTLOK_OPENMP",
+                "MONTLOK_SERIAL_WORK",
+            )
+        },
         "checkpoint_sha256": sha256(args.checkpoint),
         "fixture_sha256": sha256(args.fixture),
         "data_manifest_sha256": sha256(args.data_manifest) if args.data_manifest else None,

@@ -25,6 +25,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from linear_cpu import cpu_linear
+
 
 def heavy_tail_activation(value: torch.Tensor) -> torch.Tensor:
     negative = value.clamp_max(0)
@@ -136,14 +138,38 @@ class Mamba3CPUReference(nn.Module):
     def forward(self, inputs: torch.Tensor, **_: object) -> torch.Tensor:
         if inputs.ndim != 3 or inputs.shape[-1] != self.d_model:
             raise ValueError("Mamba3CPUReference expects [batch, length, d_model]")
-        batch, length, _ = inputs.shape
-        projected = self.in_proj(inputs.float())
+        inputs = inputs.float()
         backend = cpp_backend()
         if backend == "fused":
-            output = self._forward_fused(projected)
-        else:
-            output = self._forward_split(projected, batch, length, backend).reshape(batch, length, self.d_inner)
-        return self.out_proj(output.to(self.out_proj.weight.dtype))
+            return self._forward_native(inputs)
+        batch, length, _ = inputs.shape
+        projected = cpu_linear(inputs, self.in_proj.weight, self.in_proj.bias)
+        output = self._forward_split(projected, batch, length, backend).reshape(batch, length, self.d_inner)
+        output = output.to(self.out_proj.weight.dtype)
+        return cpu_linear(output, self.out_proj.weight, self.out_proj.bias)
+
+    def _forward_native(self, inputs: torch.Tensor) -> torch.Tensor:
+        from montlok_loader import load_montlok
+
+        return load_montlok().mamba3_siso_layer(
+            inputs,
+            self.in_proj.weight,
+            self.out_proj.weight,
+            self.B_bias,
+            self.C_bias,
+            self.B_norm.weight,
+            self.C_norm.weight,
+            self.dt_bias,
+            self.D,
+            self.d_state,
+            self.num_bc_heads,
+            self.nheads,
+            self.headdim,
+            self.num_rope_angles,
+            self.B_norm.eps,
+            self.C_norm.eps,
+            self.A_floor,
+        )
 
     def _forward_fused(self, projected: torch.Tensor) -> torch.Tensor:
         """Single montlok.cpp op from the in_proj output to the out_proj input."""

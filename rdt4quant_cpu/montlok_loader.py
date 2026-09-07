@@ -19,6 +19,7 @@ import hashlib
 import importlib
 import os
 from pathlib import Path
+import sys
 
 PREBUILT_MODULE = "montlok_cpp_v2"
 SOURCE_DIR = Path(__file__).resolve().parent
@@ -36,7 +37,13 @@ def compile_flags() -> list[str]:
     """
 
     march = os.environ.get("MONTLOK_MARCH", "native")
-    return ["-O3", f"-march={march}", "-DNDEBUG", "-fno-math-errno", "-ffp-contract=fast"]
+    return ["-O3", f"-march={march}", "-DNDEBUG", "-fno-math-errno", "-ffp-contract=fast", *openmp_flags()]
+
+
+def openmp_flags() -> list[str]:
+    if sys.platform.startswith("linux") and os.environ.get("MONTLOK_OPENMP") != "0":
+        return ["-fopenmp"]
+    return []
 
 
 def _jit_module_name(flags: list[str]) -> str:
@@ -61,6 +68,7 @@ def load_montlok():
         name=_jit_module_name(flags),
         sources=[str(path) for path in SOURCES],
         extra_cflags=flags,
+        extra_ldflags=openmp_flags(),
         extra_include_paths=[str(SOURCE_DIR)],
         with_cuda=False,
         verbose=os.environ.get("MONTLOK_VERBOSE_BUILD") == "1",

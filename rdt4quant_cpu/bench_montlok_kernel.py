@@ -52,6 +52,10 @@ BACKEND_VARS = (
     "MONTLOK_CPP_MHC",
     "MONTLOK_CPP_LAYERS",
     "MONTLOK_CPP_TAIL",
+    "MONTLOK_CPP_DNNL",
+    "MONTLOK_DNNL_MIN_ROWS",
+    "MONTLOK_CPP_NATIVE_STAGE1",
+    "MONTLOK_CPP_NATIVE_STAGE2",
 )
 
 
@@ -233,8 +237,10 @@ def bench_full_model(bench: Bench, skip_reference: bool, depth: int) -> None:
         attributed("full model: Mamba kernel only")
     with backend(MONTLOK_CPP="1", MONTLOK_CPP_TAIL="0"):
         attributed("full model: all fused ops, full sequence")
+    with backend(MONTLOK_CPP="1", MONTLOK_CPP_NATIVE_STAGE1="0", MONTLOK_CPP_NATIVE_STAGE2="0"):
+        attributed("full model: fused tail, Python orchestration")
     with backend(MONTLOK_CPP="1"):
-        attributed("full model: all fused ops, tail chain")
+        attributed("full model: native Stage-1/Stage-2 tail")
 
 
 def main() -> None:
