@@ -151,6 +151,33 @@ void test_siso(const SisoCase& c, bool timing) {
     // fp32 recurrence over L steps vs double: allow ~1e-5 relative to the output scale.
     check(name, max_abs_diff(out, ref), 2e-6 * (1.0 + absmax));
 
+    // In-kernel silu gate: feed z and compare with the pre-activated gate path
+    // (the reference gate is silu(z) rounded to float32, so only the gate's
+    // own rounding separates the two).
+    {
+        std::vector<float> z(gate.size()), out_logits(out.size());
+        std::vector<double> ref_logits(ref.size());
+        rng.fill(z, 3.0);
+        for (size_t i = 0; i < z.size(); ++i) {
+            const double zd = z[i];
+            gate[i] = static_cast<float>(zd / (1.0 + std::exp(-zd)));
+        }
+        run_all();
+        montlok::SisoPlan pl = p;
+        pl.gate = z.data();
+        pl.gate_logits = true;
+        pl.out = out_logits.data();
+        const int64_t items = montlok::siso_work_items(pl);
+        for (int64_t item = 0; item < items; ++item) {
+            montlok::siso_run_work_item(pl, item, scratch.data());
+        }
+        double gate_absmax = 0.0;
+        for (float v : out) gate_absmax = std::max(gate_absmax, std::abs(static_cast<double>(v)));
+        check(std::string(name) + " in-kernel gate", max_abs_diff(out_logits, std::vector<double>(out.begin(), out.end())),
+              2.4e-7 * (1.0 + gate_absmax));
+        (void)ref_logits;
+    }
+
     if (timing) {
         const int reps = 50;
         const double t0 = seconds_now();
@@ -373,19 +400,19 @@ void test_mhc(const MhcCase& c, bool timing) {
     std::vector<float> agg(T * d), pre(T * n), post(T * n), res(T * n * n), new_streams(T * n * d);
 
     montlok::MhcPlan p{};
-    p.streams = streams.data(); p.norm_w = norm_w.data(); p.proj_w = proj.data();
+    p.streams = streams.data(); p.stream_stride = d; p.token_stride = n * d;
+    p.norm_w = norm_w.data(); p.proj_w = proj.data();
     p.pre_bias = pre_bias.data(); p.post_bias = post_bias.data(); p.res_bias = res_bias.data();
     p.pre_alpha = 0.7; p.post_alpha = 0.6; p.res_alpha = 0.8; p.eps = static_cast<double>(1e-6f);
     p.tokens = T; p.n = n; p.d = d; p.sinkhorn_iters = c.iters;
     p.agg = agg.data(); p.pre = pre.data(); p.post = post.data(); p.res = res.data();
     std::vector<double> scratch(montlok::mhc_scratch_doubles(p));
     auto run_prepare = [&]() { montlok::mhc_prepare_range(p, 0, T, scratch.data()); };
-    auto run_combine = [&]() {
-        for (int64_t t = 0; t < T; ++t) {
-            montlok::mhc_combine_token(streams.data() + t * n * d, res.data() + t * n * n, post.data() + t * n,
-                                       out.data() + t * d, new_streams.data() + t * n * d, n, d);
-        }
-    };
+    montlok::MhcCombinePlan cp{};
+    cp.streams = streams.data(); cp.stream_stride = d; cp.token_stride = n * d;
+    cp.res = res.data(); cp.post = post.data(); cp.out = out.data(); cp.new_streams = new_streams.data();
+    cp.n = n; cp.d = d;
+    auto run_combine = [&]() { montlok::mhc_combine_range(cp, 0, T); };
     run_prepare();
     run_combine();
 
@@ -471,6 +498,73 @@ void test_mhc(const MhcCase& c, bool timing) {
     check(std::string(name) + " agg", max_abs_diff(agg, agg_ref), 1.2e-7 * (1.0 + agg_max));
     check(std::string(name) + " combine", max_abs_diff(new_streams, new_ref), 1.2e-7 * (1.0 + new_max));
 
+    // Collapse: mean over the rounded new streams, one rounding.
+    {
+        std::vector<float> scratch_streams(n * d), collapsed(T * d);
+        std::vector<double> collapsed_ref(T * d);
+        for (int64_t t = 0; t < T; ++t) {
+            montlok::mhc_combine_token(streams.data() + t * n * d, d, res.data() + t * n * n, post.data() + t * n,
+                                       out.data() + t * d, scratch_streams.data(), collapsed.data() + t * d, n, d);
+            for (int64_t k = 0; k < d; ++k) {
+                double m = 0.0;
+                for (int64_t i = 0; i < n; ++i) m += static_cast<double>(new_streams[(t * n + i) * d + k]);
+                collapsed_ref[t * d + k] = m / n;
+            }
+        }
+        check(std::string(name) + " collapse", max_abs_diff(collapsed, collapsed_ref), 1.2e-7 * (1.0 + new_max));
+    }
+
+    // Fused write + read of the next residual must equal the two separate passes.
+    {
+        std::vector<float> agg2(T * d), pre2(T * n), post2(T * n), res2(T * n * n), streams2(T * n * d);
+        montlok::MhcPlan p2 = p;
+        p2.streams = new_streams.data();
+        p2.agg = agg2.data(); p2.pre = pre2.data(); p2.post = post2.data(); p2.res = res2.data();
+        montlok::mhc_prepare_range(p2, 0, T, scratch.data());
+        std::vector<float> agg3(T * d), pre3(T * n), post3(T * n), res3(T * n * n);
+        montlok::MhcPlan p3 = p;
+        p3.streams = streams2.data();
+        p3.agg = agg3.data(); p3.pre = pre3.data(); p3.post = post3.data(); p3.res = res3.data();
+        montlok::MhcCombinePlan cp3 = cp;
+        cp3.new_streams = streams2.data();
+        montlok::mhc_combine_prepare_range(cp3, p3, 0, T, scratch.data());
+        check(std::string(name) + " fused streams", max_abs_diff(streams2, std::vector<double>(new_streams.begin(), new_streams.end())), 0.0);
+        check(std::string(name) + " fused agg", max_abs_diff(agg3, std::vector<double>(agg2.begin(), agg2.end())), 0.0);
+        check(std::string(name) + " fused pre", max_abs_diff(pre3, std::vector<double>(pre2.begin(), pre2.end())), 0.0);
+        check(std::string(name) + " fused post", max_abs_diff(post3, std::vector<double>(post2.begin(), post2.end())), 0.0);
+        check(std::string(name) + " fused res", max_abs_diff(res3, std::vector<double>(res2.begin(), res2.end())), 0.0);
+    }
+
+    // Broadcast streams (the expanded backbone) must match the materialised copy.
+    {
+        std::vector<float> backbone(T * d), expanded(T * n * d);
+        rng.fill(backbone, 1.5);
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t i = 0; i < n; ++i) {
+                std::copy(backbone.begin() + t * d, backbone.begin() + (t + 1) * d, expanded.begin() + (t * n + i) * d);
+            }
+        }
+        std::vector<float> agg_a(T * d), pre_a(T * n), post_a(T * n), res_a(T * n * n);
+        std::vector<float> agg_b(T * d), pre_b(T * n), post_b(T * n), res_b(T * n * n);
+        montlok::MhcPlan pa = p, pb = p;
+        pa.streams = expanded.data();
+        pa.agg = agg_a.data(); pa.pre = pre_a.data(); pa.post = post_a.data(); pa.res = res_a.data();
+        pb.streams = backbone.data(); pb.stream_stride = 0; pb.token_stride = d;
+        pb.agg = agg_b.data(); pb.pre = pre_b.data(); pb.post = post_b.data(); pb.res = res_b.data();
+        montlok::mhc_prepare_range(pa, 0, T, scratch.data());
+        montlok::mhc_prepare_range(pb, 0, T, scratch.data());
+        check(std::string(name) + " broadcast agg", max_abs_diff(agg_b, std::vector<double>(agg_a.begin(), agg_a.end())), 0.0);
+        check(std::string(name) + " broadcast res", max_abs_diff(res_b, std::vector<double>(res_a.begin(), res_a.end())), 0.0);
+        std::vector<float> new_a(T * n * d), new_b(T * n * d);
+        montlok::MhcCombinePlan ca = cp, cb = cp;
+        ca.streams = expanded.data(); ca.res = res_a.data(); ca.post = post_a.data(); ca.new_streams = new_a.data();
+        cb.streams = backbone.data(); cb.stream_stride = 0; cb.token_stride = d;
+        cb.res = res_a.data(); cb.post = post_a.data(); cb.new_streams = new_b.data();
+        montlok::mhc_combine_range(ca, 0, T);
+        montlok::mhc_combine_range(cb, 0, T);
+        check(std::string(name) + " broadcast combine", max_abs_diff(new_b, std::vector<double>(new_a.begin(), new_a.end())), 0.0);
+    }
+
     if (timing) {
         const int reps = 200;
         double t0 = seconds_now();
@@ -526,10 +620,125 @@ void test_rms_norm(int64_t rows, int64_t dim, int64_t groups, int64_t row_stride
     }
 }
 
-void test_mla_rope(int64_t tokens, int64_t length, int64_t heads, int64_t nope, int64_t rope, bool timing) {
+#ifdef MONTLOK_VECTOR_EXT
+void test_exp() {
+    // Dense sweep of float32 inputs over the range that matters for silu and
+    // the extremes; compare with libm's double exp after float32 rounding.
+    double max_ulp = 0.0;
+    int64_t mismatches = 0;
+    int64_t count = 0;
+    for (double x = -110.0; x <= 110.0; x += 0.00731) {
+        const float xf = static_cast<float>(x);
+        montlok::v4d in = {xf, -xf, xf * 0.5, xf * 0.125};
+        const montlok::v4d got = montlok::exp4_d(in);
+        for (int lane = 0; lane < 4; ++lane) {
+            const double want = std::exp(in[lane]);
+            const float want_f = static_cast<float>(want);
+            const float got_f = static_cast<float>(got[lane]);
+            if (want_f != got_f) {
+                ++mismatches;
+            }
+            if (want > 0.0 && std::isfinite(want)) {
+                max_ulp = std::max(max_ulp, std::abs(got[lane] - want) / (want * 2.220446049250313e-16));
+            }
+            ++count;
+        }
+    }
+    check("exp4_d double ulp", max_ulp, 4.0);
+    check("exp4_d float32 mismatches", static_cast<double>(mismatches), 0.0);
+    // Extremes: the clamp keeps results finite and silu of large |z| exact.
+    montlok::v4d big = {800.0, -800.0, 1e30, -1e30};
+    const montlok::v4d s = montlok::silu4_d(big);
+    const float s1 = static_cast<float>(s[1]);
+    const float s3 = static_cast<float>(s[3]);
+    check("silu4_d extremes", std::abs(s[0] - 800.0) + std::abs(s1) + std::abs(s[2] - 1e30) / 1e30 + std::abs(s3), 0.0);
+    (void)count;
+}
+#endif
+
+void test_swiglu(int64_t rows, int64_t hidden, int64_t row_stride, bool timing) {
+    Rng rng(37);
+    std::vector<float> x(rows * row_stride), out(rows * hidden);
+    rng.fill(x, 3.0);
+    montlok::swiglu_rows(x.data(), row_stride, hidden, 0, rows, out.data());
+    std::vector<double> ref(rows * hidden);
+    double absmax = 0.0;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t k = 0; k < hidden; ++k) {
+            const double z = x[r * row_stride + k];
+            const double y = z / (1.0 + std::exp(-z)) * static_cast<double>(x[r * row_stride + hidden + k]);
+            ref[r * hidden + k] = y;
+            absmax = std::max(absmax, std::abs(y));
+        }
+    }
+    char name[128];
+    std::snprintf(name, sizeof(name), "swiglu rows%lld hidden%lld stride%lld", (long long)rows, (long long)hidden,
+                  (long long)row_stride);
+    check(name, max_abs_diff(out, ref), 1.2e-7 * (1.0 + absmax));
+    if (timing) {
+        const int reps = 200;
+        const double t0 = seconds_now();
+        for (int rep = 0; rep < reps; ++rep) {
+            montlok::swiglu_rows(x.data(), row_stride, hidden, 0, rows, out.data());
+        }
+        std::printf("  timing: swiglu %.1f us/pass single-threaded\n", (seconds_now() - t0) / reps * 1e6);
+    }
+}
+
+void test_layer_norm(int64_t rows, int64_t dim, int64_t row_stride, bool with_bias, bool timing) {
+    Rng rng(41);
+    std::vector<float> x(rows * row_stride), w(dim), b(dim), out(rows * dim);
+    rng.fill(x, 2.0);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t k = 0; k < dim; ++k) x[r * row_stride + k] += 0.75f;  // non-zero mean
+    }
+    for (auto& v : w) v = 1.0f + rng.gauss(0.3);
+    for (auto& v : b) v = rng.gauss(0.5);
+    const double eps = static_cast<double>(1e-5f);
+    montlok::layer_norm_rows(x.data(), row_stride, w.data(), with_bias ? b.data() : nullptr, eps, dim, 0, rows,
+                             out.data());
+    std::vector<double> ref(rows * dim);
+    double absmax = 0.0;
+    for (int64_t r = 0; r < rows; ++r) {
+        double mean = 0.0;
+        for (int64_t k = 0; k < dim; ++k) mean += x[r * row_stride + k];
+        mean /= dim;
+        double var = 0.0;
+        for (int64_t k = 0; k < dim; ++k) {
+            const double a = x[r * row_stride + k] - mean;
+            var += a * a;
+        }
+        const double rstd = 1.0 / std::sqrt(var / dim + eps);
+        for (int64_t k = 0; k < dim; ++k) {
+            double y = (x[r * row_stride + k] - mean) * rstd * w[k];
+            if (with_bias) y += b[k];
+            ref[r * dim + k] = y;
+            absmax = std::max(absmax, std::abs(y));
+        }
+    }
+    char name[128];
+    std::snprintf(name, sizeof(name), "layer_norm rows%lld dim%lld stride%lld bias%d", (long long)rows, (long long)dim,
+                  (long long)row_stride, with_bias ? 1 : 0);
+    check(name, max_abs_diff(out, ref), 1.2e-7 * (1.0 + absmax));
+    if (timing) {
+        const int reps = 500;
+        const double t0 = seconds_now();
+        for (int rep = 0; rep < reps; ++rep) {
+            montlok::layer_norm_rows(x.data(), row_stride, w.data(), with_bias ? b.data() : nullptr, eps, dim, 0, rows,
+                                     out.data());
+        }
+        std::printf("  timing: layer_norm %.1f us/pass single-threaded\n", (seconds_now() - t0) / reps * 1e6);
+    }
+}
+
+void test_mla_rope(int64_t tokens, int64_t length, int64_t heads, int64_t nope, int64_t rope, bool timing,
+                   int64_t q_length = -1) {
     Rng rng(41);
     const int64_t head_dim = nope + rope;
-    std::vector<float> q(tokens * heads * head_dim), kv(tokens * heads * (nope + head_dim)), k_rope(tokens * rope);
+    if (q_length < 0) q_length = length;
+    const int64_t sequences = tokens / length;
+    const int64_t q_first = length - q_length;
+    std::vector<float> q(sequences * q_length * heads * head_dim), kv(tokens * heads * (nope + head_dim)), k_rope(tokens * rope);
     std::vector<float> cosine(length * rope), sine(length * rope), k(tokens * heads * head_dim), scratch(rope);
     rng.fill(q);
     rng.fill(kv);
@@ -543,7 +752,7 @@ void test_mla_rope(int64_t tokens, int64_t length, int64_t heads, int64_t nope, 
     }
     std::vector<float> q_in = q;
     montlok::MlaRopePlan p{};
-    p.q = q.data(); p.q_token_stride = heads * head_dim; p.q_head_stride = head_dim;
+    p.q = q.data(); p.q_token_stride = heads * head_dim; p.q_head_stride = head_dim; p.q_length = q_length;
     p.kv = kv.data(); p.kv_token_stride = heads * (nope + head_dim); p.kv_head_stride = nope + head_dim;
     p.k_rope = k_rope.data(); p.k_rope_token_stride = rope;
     p.cosine = cosine.data(); p.sine = sine.data(); p.k = k.data();
@@ -562,19 +771,23 @@ void test_mla_rope(int64_t tokens, int64_t length, int64_t heads, int64_t nope, 
     };
     for (int64_t t = 0; t < tokens; ++t) {
         const int64_t pos = t % length;
+        const int64_t seq = t / length;
         for (int64_t h = 0; h < heads; ++h) {
             const int64_t base = (t * heads + h) * head_dim;
             for (int64_t i = 0; i < nope; ++i) {
-                q_ref[base + i] = q_in[base + i];
                 k_ref[base + i] = kv[(t * heads + h) * (nope + head_dim) + i];
             }
-            rope_ref(q_in.data() + base + nope, pos, q_ref.data() + base + nope);
             rope_ref(k_rope.data() + t * rope, pos, k_ref.data() + base + nope);
+            if (pos >= q_first) {
+                const int64_t qbase = ((seq * q_length + pos - q_first) * heads + h) * head_dim;
+                for (int64_t i = 0; i < nope; ++i) q_ref[qbase + i] = q_in[qbase + i];
+                rope_ref(q_in.data() + qbase + nope, pos, q_ref.data() + qbase + nope);
+            }
         }
     }
     char name[128];
-    std::snprintf(name, sizeof(name), "mla_rope tokens%lld heads%lld nope%lld rope%lld", (long long)tokens, (long long)heads,
-                  (long long)nope, (long long)rope);
+    std::snprintf(name, sizeof(name), "mla_rope tokens%lld heads%lld nope%lld rope%lld q%lld", (long long)tokens,
+                  (long long)heads, (long long)nope, (long long)rope, (long long)q_length);
     check(std::string(name) + " q", max_abs_diff(q, q_ref), 6e-7);
     check(std::string(name) + " k", max_abs_diff(k, k_ref), 6e-7);
     if (timing) {
@@ -627,8 +840,18 @@ int main() {
     test_rms_norm(480, 256, 1, 256, true);
     test_rms_norm(480, 256, 8, 256, false);        // GroupedRMSNorm as used by Mamba3Layer
     test_rms_norm(37, 100, 4, 133, false);         // odd group size, strided rows
+#ifdef MONTLOK_VECTOR_EXT
+    test_exp();
+#endif
+    test_swiglu(480, 768, 1536, true);
+    test_swiglu(37, 50, 133, false);               // odd hidden, padded rows
+    test_layer_norm(480, 256, 256, true, true);
+    test_layer_norm(480, 64, 64, true, false);     // kv_norm shape
+    test_layer_norm(37, 100, 133, false, false);   // odd dim, strided rows, no bias
     test_mla_rope(480, 480, 4, 32, 32, true);
     test_mla_rope(74, 37, 3, 12, 10, false);       // batch 2, odd dims
+    test_mla_rope(480, 480, 4, 32, 32, false, 1);  // trailing query only
+    test_mla_rope(74, 37, 3, 12, 10, false, 5);    // batch 2, trailing 5 queries
 
     if (g_failures) {
         std::printf("%d check(s) FAILED\n", g_failures);

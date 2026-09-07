@@ -10,7 +10,7 @@ Backends (selected per call from the environment, see :func:`cpp_backend`):
     Pure PyTorch quadratic reference; the numerical oracle for the tests.
 ``MONTLOK_CPP=1``
     Fused montlok.cpp forward: one C++ op between ``in_proj`` and ``out_proj``
-    (BCNorm, biases, dt/A/trap, rotary cumsum, recurrence, gating).
+    (BCNorm, biases, dt/A/trap, rotary cumsum, recurrence, silu gating).
 ``MONTLOK_CPP=1 MONTLOK_CPP_FUSED=0``
     PyTorch pre-processing + the vectorised C++ recurrence only. Debug ladder
     for isolating a mismatch between the fused pre-processing and the kernel.
@@ -149,10 +149,11 @@ class Mamba3CPUReference(nn.Module):
         """Single montlok.cpp op from the in_proj output to the out_proj input."""
         from montlok_loader import load_montlok
 
-        gate = F.silu(projected[..., : self.d_inner])
+        # An empty gate tells the kernel to evaluate silu(z) on the z lanes of
+        # `projected` itself (double precision, rounded once with the product).
         return load_montlok().mamba3_siso_forward(
             projected,
-            gate,
+            projected.new_empty(0),
             self.B_bias,
             self.C_bias,
             self.B_norm.weight,

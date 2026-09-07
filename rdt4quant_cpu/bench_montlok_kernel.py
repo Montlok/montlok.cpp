@@ -8,7 +8,7 @@ model geometry:
   path and the fused path, plus the fused op and the bare recurrence kernel
 * one mHC hyper-connection, RMSNorm and the MLA attention block, reference vs C++
 * the whole MultiAssetRDTCPU forward (depth 4) with per-stage attribution,
-  reference vs all fused ops
+  including full-sequence and trailing-position fused paths
 
     python bench_montlok_kernel.py --threads 16 --iterations 50
     python bench_montlok_kernel.py --threads 32 --skip-reference   # fast, C++ only
@@ -44,9 +44,15 @@ from Model.layers.rmsnorm import RMSNorm  # noqa: E402
 from mamba3_cpu import Mamba3CPUReference  # noqa: E402
 from mhc_cpu import ManifoldHyperConnectionCPU  # noqa: E402
 from mla_cpu import MLACPU  # noqa: E402
-from rmsnorm_cpu import install_cpu_norms  # noqa: E402
+from layers_cpu import install_cpu_layers  # noqa: E402
 
-BACKEND_VARS = ("MONTLOK_CPP", "MONTLOK_CPP_FUSED", "MONTLOK_CPP_MHC", "MONTLOK_CPP_LAYERS")
+BACKEND_VARS = (
+    "MONTLOK_CPP",
+    "MONTLOK_CPP_FUSED",
+    "MONTLOK_CPP_MHC",
+    "MONTLOK_CPP_LAYERS",
+    "MONTLOK_CPP_TAIL",
+)
 
 
 @contextmanager
@@ -84,7 +90,11 @@ class Bench:
                 fn()
                 samples.append((time.perf_counter() - start) * 1e3)
         median = statistics.median(samples)
-        self.results[name] = {"median_ms": median, "min_ms": min(samples), "p95_ms": sorted(samples)[int(0.95 * (len(samples) - 1))]}
+        self.results[name] = {
+            "median_ms": median,
+            "min_ms": min(samples),
+            "p95_ms": sorted(samples)[int(0.95 * (len(samples) - 1))],
+        }
         print(f"{name:<52s} median {median:8.3f} ms   min {min(samples):8.3f} ms")
         return median
 
@@ -112,8 +122,16 @@ def bench_mamba(bench: Bench, skip_reference: bool) -> None:
         torch.manual_seed(1)
         q, k = torch.randn(B, L, H, N), torch.randn(B, L, H, N)
         v, gate = torch.randn(B, L, H, D), torch.randn(B, L, H, D)
-        adt, dt, trap, skip = -torch.rand(B, L, H) * 0.1, torch.rand(B, L, H) * 0.1, torch.randn(B, L, H), torch.randn(H)
-        bench.time("  recurrence kernel only", lambda: ext.mamba3_siso_recurrent(q, k, v, gate, adt, dt, trap, skip))
+        adt, dt, trap, skip = (
+            -torch.rand(B, L, H) * 0.1,
+            torch.rand(B, L, H) * 0.1,
+            torch.randn(B, L, H),
+            torch.randn(H),
+        )
+        bench.time(
+            "  recurrence kernel only",
+            lambda: ext.mamba3_siso_recurrent(q, k, v, gate, adt, dt, trap, skip),
+        )
 
 
 def bench_stage2_parts(bench: Bench, skip_reference: bool) -> None:
@@ -126,7 +144,10 @@ def bench_stage2_parts(bench: Bench, skip_reference: bool) -> None:
     streams = torch.randn(1, 480, 4, 256)
     identity = lambda a: a  # noqa: E731
     if not skip_reference:
-        bench.time("mHC hyper-connection: PyTorch reference", lambda: ManifoldHyperConnection.forward(hc, streams, identity))
+        bench.time(
+            "mHC hyper-connection: PyTorch reference",
+            lambda: ManifoldHyperConnection.forward(hc, streams, identity),
+        )
     with backend(MONTLOK_CPP="1"):
         bench.time("mHC hyper-connection: C++ fused", lambda: hc(streams, identity))
 
@@ -135,7 +156,7 @@ def bench_stage2_parts(bench: Bench, skip_reference: bool) -> None:
     x = torch.randn(1, 480, 256)
     if not skip_reference:
         bench.time("RMSNorm [1,480,256]: PyTorch reference", lambda: holder(x))
-    install_cpu_norms(holder)
+    install_cpu_layers(holder)
     with backend(MONTLOK_CPP="1"):
         bench.time("RMSNorm [1,480,256]: C++", lambda: holder(x))
 
@@ -183,6 +204,8 @@ def bench_full_model(bench: Bench, skip_reference: bool, depth: int) -> None:
     attach("stage2 layer", stage2)
     attach("stage2 attn_hc (incl. attention)", stage2.attn_hc)
     attach("stage2 ffn_hc (incl. ffn)", stage2.ffn_hc)
+    attach("stage2 attention", stage2.attn)
+    attach("stage2 FFN", stage2.ffn)
 
     def run():
         with torch.inference_mode():
@@ -201,10 +224,17 @@ def bench_full_model(bench: Bench, skip_reference: bool, depth: int) -> None:
     if not skip_reference:
         with backend():
             attributed("full model: PyTorch reference")
-    with backend(MONTLOK_CPP="1", MONTLOK_CPP_MHC="0", MONTLOK_CPP_LAYERS="0"):
+    with backend(
+        MONTLOK_CPP="1",
+        MONTLOK_CPP_MHC="0",
+        MONTLOK_CPP_LAYERS="0",
+        MONTLOK_CPP_TAIL="0",
+    ):
         attributed("full model: Mamba kernel only")
+    with backend(MONTLOK_CPP="1", MONTLOK_CPP_TAIL="0"):
+        attributed("full model: all fused ops, full sequence")
     with backend(MONTLOK_CPP="1"):
-        attributed("full model: all fused ops")
+        attributed("full model: all fused ops, tail chain")
 
 
 def main() -> None:
@@ -236,7 +266,12 @@ def main() -> None:
     if "model" in sections:
         bench_full_model(bench, args.skip_reference, args.depth)
     if args.output:
-        payload = {"threads": args.threads, "torch": torch.__version__, "build": info, "timings": bench.results}
+        payload = {
+            "threads": args.threads,
+            "torch": torch.__version__,
+            "build": info,
+            "timings": bench.results,
+        }
         args.output.write_text(json.dumps(payload, indent=2) + "\n")
 
 

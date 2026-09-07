@@ -23,9 +23,13 @@
 namespace montlok {
 
 // Everything one ManifoldHyperConnection.forward needs before the wrapped
-// layer runs. Tokens are B*L flattened; `streams` is [tokens, n, d] contiguous.
+// layer runs. Tokens are B*L flattened; `streams` is [tokens, n, d] with the
+// stream rows `stream_stride` floats apart (d for a contiguous tensor, 0 when
+// every stream is the same [tokens, d] row, i.e. the expanded backbone).
 struct MhcPlan {
     const float* streams;
+    int64_t stream_stride;
+    int64_t token_stride;   // floats between tokens of `streams`
     const float* norm_w;    // [d] RMSNorm weight of dyn_norm
     const double* proj_w;   // [(2n + n*n), d] pre_proj, post_proj, res_proj rows widened
     const float* pre_bias;  // [n]
@@ -216,7 +220,8 @@ inline void mhc_prepare_block(const MhcPlan& p, int64_t token0, int64_t count, d
             }
             continue;
         }
-        const float* __restrict streams = p.streams + (token0 + lane) * n * d;
+        const float* __restrict streams = p.streams + (token0 + lane) * p.token_stride;
+        const int64_t sd = p.stream_stride;
         double sumsq = 0.0;
         int64_t k = 0;
 #ifdef MONTLOK_VECTOR_EXT
@@ -226,7 +231,7 @@ inline void mhc_prepare_block(const MhcPlan& p, int64_t token0, int64_t count, d
             for (; k + 4 <= d; k += 4) {
                 v4d m = load4f_as_d(streams + k);
                 for (int64_t i = 1; i < n; ++i) {
-                    m += load4f_as_d(streams + i * d + k);
+                    m += load4f_as_d(streams + i * sd + k);
                 }
                 m *= vinv;
                 store4d(ref_lane + k, m);
@@ -238,7 +243,7 @@ inline void mhc_prepare_block(const MhcPlan& p, int64_t token0, int64_t count, d
         for (; k < d; ++k) {
             double m = 0.0;
             for (int64_t i = 0; i < n; ++i) {
-                m += static_cast<double>(streams[i * d + k]);
+                m += static_cast<double>(streams[i * sd + k]);
             }
             m *= inv_n;
             ref_lane[k] = m;
@@ -287,14 +292,15 @@ inline void mhc_prepare_block(const MhcPlan& p, int64_t token0, int64_t count, d
         }
 
         // agg = sum_i pre_i * streams_i: products exact in double, one rounding.
-        const float* __restrict streams = p.streams + token * n * d;
+        const float* __restrict streams = p.streams + token * p.token_stride;
+        const int64_t sd = p.stream_stride;
         float* __restrict agg = p.agg + token * d;
         int64_t k = 0;
 #ifdef MONTLOK_VECTOR_EXT
         for (; k + 4 <= d; k += 4) {
             v4d acc = splat4d(static_cast<double>(pre[0])) * load4f_as_d(streams + k);
             for (int64_t i = 1; i < n; ++i) {
-                acc += splat4d(static_cast<double>(pre[i])) * load4f_as_d(streams + i * d + k);
+                acc += splat4d(static_cast<double>(pre[i])) * load4f_as_d(streams + i * sd + k);
             }
             store4d_as_f(agg + k, acc);
         }
@@ -302,7 +308,7 @@ inline void mhc_prepare_block(const MhcPlan& p, int64_t token0, int64_t count, d
         for (; k < d; ++k) {
             double acc = 0.0;
             for (int64_t i = 0; i < n; ++i) {
-                acc += static_cast<double>(pre[i]) * static_cast<double>(streams[i * d + k]);
+                acc += static_cast<double>(pre[i]) * static_cast<double>(streams[i * sd + k]);
             }
             agg[k] = static_cast<float>(acc);
         }
@@ -326,50 +332,67 @@ inline void mhc_prepare_range(const MhcPlan& p, int64_t begin, int64_t end, doub
 
 // new_streams_i = sum_j res_ij * streams_j + post_i * out for one token, with
 // the n x n matrix and the n write weights as compile-time-unrolled registers.
+// `streams` rows are `sd` floats apart (0 broadcasts one row to every stream).
+// When `collapsed` is non-null the mean over the n rounded float32 streams
+// (TwoStageCore._collapse) is written there as well, in double, one rounding.
 template <int N>
-inline void mhc_combine_token_n(const float* __restrict streams, const float* __restrict res,
+inline void mhc_combine_token_n(const float* __restrict streams, int64_t sd, const float* __restrict res,
                                 const float* __restrict post, const float* __restrict out,
-                                float* __restrict new_streams, int64_t d) noexcept {
+                                float* __restrict new_streams, float* __restrict collapsed, int64_t d) noexcept {
+    const double inv_n = 1.0 / static_cast<double>(N);
     int64_t k = 0;
 #ifdef MONTLOK_VECTOR_EXT
     for (; k + 4 <= d; k += 4) {
         const v4d o = load4f_as_d(out + k);
         v4d s[N];
         for (int j = 0; j < N; ++j) {
-            s[j] = load4f_as_d(streams + j * d + k);
+            s[j] = load4f_as_d(streams + j * sd + k);
         }
+        v4d mean = splat4d(0.0);
         for (int i = 0; i < N; ++i) {
             v4d acc = splat4d(static_cast<double>(post[i])) * o;
             for (int j = 0; j < N; ++j) {
                 acc += splat4d(static_cast<double>(res[i * N + j])) * s[j];
             }
             store4d_as_f(new_streams + i * d + k, acc);
+            if (collapsed != nullptr) {
+                mean += load4f_as_d(new_streams + i * d + k);
+            }
+        }
+        if (collapsed != nullptr) {
+            store4d_as_f(collapsed + k, mean * splat4d(inv_n));
         }
     }
 #endif
     for (; k < d; ++k) {
+        double mean = 0.0;
         for (int i = 0; i < N; ++i) {
             double acc = static_cast<double>(post[i]) * static_cast<double>(out[k]);
             for (int j = 0; j < N; ++j) {
-                acc += static_cast<double>(res[i * N + j]) * static_cast<double>(streams[j * d + k]);
+                acc += static_cast<double>(res[i * N + j]) * static_cast<double>(streams[j * sd + k]);
             }
             new_streams[i * d + k] = static_cast<float>(acc);
+            mean += static_cast<double>(new_streams[i * d + k]);
+        }
+        if (collapsed != nullptr) {
+            collapsed[k] = static_cast<float>(mean * inv_n);
         }
     }
 }
 
-inline void mhc_combine_token(const float* __restrict streams, const float* __restrict res,
+inline void mhc_combine_token(const float* __restrict streams, int64_t sd, const float* __restrict res,
                               const float* __restrict post, const float* __restrict out,
-                              float* __restrict new_streams, int64_t n, int64_t d) noexcept {
+                              float* __restrict new_streams, float* __restrict collapsed, int64_t n,
+                              int64_t d) noexcept {
     switch (n) {
-        case 1: return mhc_combine_token_n<1>(streams, res, post, out, new_streams, d);
-        case 2: return mhc_combine_token_n<2>(streams, res, post, out, new_streams, d);
-        case 3: return mhc_combine_token_n<3>(streams, res, post, out, new_streams, d);
-        case 4: return mhc_combine_token_n<4>(streams, res, post, out, new_streams, d);
-        case 5: return mhc_combine_token_n<5>(streams, res, post, out, new_streams, d);
-        case 6: return mhc_combine_token_n<6>(streams, res, post, out, new_streams, d);
-        case 7: return mhc_combine_token_n<7>(streams, res, post, out, new_streams, d);
-        case 8: return mhc_combine_token_n<8>(streams, res, post, out, new_streams, d);
+        case 1: return mhc_combine_token_n<1>(streams, sd, res, post, out, new_streams, collapsed, d);
+        case 2: return mhc_combine_token_n<2>(streams, sd, res, post, out, new_streams, collapsed, d);
+        case 3: return mhc_combine_token_n<3>(streams, sd, res, post, out, new_streams, collapsed, d);
+        case 4: return mhc_combine_token_n<4>(streams, sd, res, post, out, new_streams, collapsed, d);
+        case 5: return mhc_combine_token_n<5>(streams, sd, res, post, out, new_streams, collapsed, d);
+        case 6: return mhc_combine_token_n<6>(streams, sd, res, post, out, new_streams, collapsed, d);
+        case 7: return mhc_combine_token_n<7>(streams, sd, res, post, out, new_streams, collapsed, d);
+        case 8: return mhc_combine_token_n<8>(streams, sd, res, post, out, new_streams, collapsed, d);
         default: break;
     }
     for (int64_t i = 0; i < n; ++i) {
@@ -379,10 +402,56 @@ inline void mhc_combine_token(const float* __restrict streams, const float* __re
         for (int64_t k = 0; k < d; ++k) {
             double acc = post_i * static_cast<double>(out[k]);
             for (int64_t j = 0; j < n; ++j) {
-                acc += static_cast<double>(row[j]) * static_cast<double>(streams[j * d + k]);
+                acc += static_cast<double>(row[j]) * static_cast<double>(streams[j * sd + k]);
             }
             dst[k] = static_cast<float>(acc);
         }
+    }
+    if (collapsed != nullptr) {
+        const double inv_n = 1.0 / static_cast<double>(n);
+        for (int64_t k = 0; k < d; ++k) {
+            double mean = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                mean += static_cast<double>(new_streams[i * d + k]);
+            }
+            collapsed[k] = static_cast<float>(mean * inv_n);
+        }
+    }
+}
+
+// Second half of a hyper-connection over all tokens: inputs of the residual
+// that just ran, plus the new streams it writes.
+struct MhcCombinePlan {
+    const float* streams;   // [tokens, n, d] rows stream_stride apart, tokens token_stride apart
+    int64_t stream_stride;
+    int64_t token_stride;
+    const float* res;       // [tokens, n, n]
+    const float* post;      // [tokens, n]
+    const float* out;       // [tokens, d]
+    float* new_streams;     // [tokens, n, d] contiguous
+    float* collapsed;       // [tokens, d] or null
+    int64_t n;
+    int64_t d;
+};
+
+inline void mhc_combine_range(const MhcCombinePlan& c, int64_t begin, int64_t end) noexcept {
+    for (int64_t token = begin; token < end; ++token) {
+        mhc_combine_token(c.streams + token * c.token_stride, c.stream_stride, c.res + token * c.n * c.n,
+                          c.post + token * c.n, c.out + token * c.d, c.new_streams + token * c.n * c.d,
+                          c.collapsed != nullptr ? c.collapsed + token * c.d : nullptr, c.n, c.d);
+    }
+}
+
+// Write step of one residual fused with the read step of the next: for each
+// block of tokens the new streams are produced and immediately consumed by
+// mhc_prepare_block while they are still in L1. `p.streams` must point at
+// `c.new_streams` with contiguous strides.
+inline void mhc_combine_prepare_range(const MhcCombinePlan& c, const MhcPlan& p, int64_t begin, int64_t end,
+                                      double* __restrict scratch) noexcept {
+    for (int64_t token = begin; token < end; token += kMhcTokenBlock) {
+        const int64_t count = std::min<int64_t>(kMhcTokenBlock, end - token);
+        mhc_combine_range(c, token, token + count);
+        mhc_prepare_block(p, token, count, scratch);
     }
 }
 

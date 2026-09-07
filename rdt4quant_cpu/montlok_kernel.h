@@ -118,8 +118,9 @@ struct SisoPlan {
     Strides3 ks;
     const float* v;     // [B, L, H, D]
     Strides3 vs;
-    const float* gate;  // [B, L, H, D], already z * sigmoid(z)
+    const float* gate;  // [B, L, H, D]: z * sigmoid(z), or the raw z lanes when gate_logits
     Strides3 gs;
+    bool gate_logits;   // apply silu to `gate` inside the kernel (double, one rounding)
     const float* alpha; // [B, L, H] contiguous
     const float* beta;  // [B, L, H] contiguous
     const float* gamma; // [B, L, H] contiguous
@@ -206,8 +207,79 @@ inline v4d splat4d(double x) noexcept {
     return v4d{x, x, x, x};
 }
 
+typedef int64_t v4i __attribute__((vector_size(32)));
+
+inline v4i splat4i(int64_t x) noexcept {
+    return v4i{x, x, x, x};
+}
+
 inline double hsum4d(const v4d& v) noexcept {
     return (v[0] + v[1]) + (v[2] + v[3]);
+}
+
+// exp of four doubles. Inputs are clamped to [-708, 708] (the callers only
+// feed it float32 values whose exponential is then combined with 1.0, so
+// anything beyond is indistinguishable from the clamp). Cody-Waite reduction
+// with a two-part ln2 to |r| <= ln2 / 2, Taylor polynomial to r^13 (truncation
+// < 5e-18 relative), then the 2^k scale is assembled directly in the exponent
+// field. The result is within a few double ulp of the true value, so after
+// rounding to float32 it agrees with the correctly rounded exp essentially
+// always.
+inline v4d exp4_d(v4d x) noexcept {
+    for (int lane = 0; lane < 4; ++lane) {
+        x[lane] = std::min(std::max(x[lane], -708.0), 708.0);
+    }
+    // k = round(x / ln2). Adding 1.5 * 2^52 rounds to the nearest integer in the
+    // low mantissa bits; those bits are reused below to build 2^k directly.
+    const v4d magic = splat4d(6755399441055744.0);
+    const v4d k_magic = x * splat4d(1.4426950408889634074) + magic;
+    const v4d kf = k_magic - magic;
+    const v4d r = (x - kf * splat4d(6.93147180369123816490e-01)) - kf * splat4d(1.90821492927058770002e-10);
+    v4d p = splat4d(1.0 / 6227020800.0);
+    p = p * r + splat4d(1.0 / 479001600.0);
+    p = p * r + splat4d(1.0 / 39916800.0);
+    p = p * r + splat4d(1.0 / 3628800.0);
+    p = p * r + splat4d(1.0 / 362880.0);
+    p = p * r + splat4d(1.0 / 40320.0);
+    p = p * r + splat4d(1.0 / 5040.0);
+    p = p * r + splat4d(1.0 / 720.0);
+    p = p * r + splat4d(1.0 / 120.0);
+    p = p * r + splat4d(1.0 / 24.0);
+    p = p * r + splat4d(1.0 / 6.0);
+    p = p * r + splat4d(0.5);
+    p = p * r + splat4d(1.0);
+    p = p * r + splat4d(1.0);
+    // The low 12 mantissa bits of k_magic hold k modulo 4096 (two's
+    // complement); shifted into the exponent field and offset by the bits of
+    // 1.0 they give exactly 2^k for the clamped range.
+    v4i k_bits;
+    std::memcpy(&k_bits, &k_magic, sizeof(k_bits));
+    const v4i scale_bits = (k_bits << 52) + splat4i(4607182418800017408LL);  // 0x3FF0000000000000
+    v4d scale;
+    std::memcpy(&scale, &scale_bits, sizeof(scale));
+    return p * scale;
+}
+
+// silu(z) = z * sigmoid(z) for four doubles.
+inline v4d silu4_d(const v4d& z) noexcept {
+    return z / (splat4d(1.0) + exp4_d(-z));
+}
+
+// y * silu(z) for eight floats, evaluated in double and rounded once.
+inline v8f gate_silu8(const v8f& y, const v8f& z) noexcept {
+    v4f y_lo, y_hi, z_lo, z_hi;
+    std::memcpy(&y_lo, &y, sizeof(y_lo));
+    std::memcpy(&y_hi, reinterpret_cast<const char*>(&y) + sizeof(y_lo), sizeof(y_hi));
+    std::memcpy(&z_lo, &z, sizeof(z_lo));
+    std::memcpy(&z_hi, reinterpret_cast<const char*>(&z) + sizeof(z_lo), sizeof(z_hi));
+    const v4d lo = __builtin_convertvector(y_lo, v4d) * silu4_d(__builtin_convertvector(z_lo, v4d));
+    const v4d hi = __builtin_convertvector(y_hi, v4d) * silu4_d(__builtin_convertvector(z_hi, v4d));
+    const v4f lo_f = __builtin_convertvector(lo, v4f);
+    const v4f hi_f = __builtin_convertvector(hi, v4f);
+    v8f out;
+    std::memcpy(&out, &lo_f, sizeof(lo_f));
+    std::memcpy(reinterpret_cast<char*>(&out) + sizeof(lo_f), &hi_f, sizeof(hi_f));
+    return out;
 }
 
 // sin and cos of four angles in double precision. The angles are the fp32
@@ -336,9 +408,16 @@ inline void siso_block_vec(const SisoPlan& p, int64_t b, int64_t h, int64_t d0, 
             }
         }
 
-        for (int i = 0; i < NV; ++i) {
-            const v8f y = (acc0[i] + acc1[i]) + skipv * load8(v_row + 8 * i);
-            store8(o_row + 8 * i, y * load8(g_row + 8 * i));
+        if (p.gate_logits) {
+            for (int i = 0; i < NV; ++i) {
+                const v8f y = (acc0[i] + acc1[i]) + skipv * load8(v_row + 8 * i);
+                store8(o_row + 8 * i, gate_silu8(y, load8(g_row + 8 * i)));
+            }
+        } else {
+            for (int i = 0; i < NV; ++i) {
+                const v8f y = (acc0[i] + acc1[i]) + skipv * load8(v_row + 8 * i);
+                store8(o_row + 8 * i, y * load8(g_row + 8 * i));
+            }
         }
 
         q_row += p.qs.t;
@@ -406,7 +485,13 @@ inline void siso_head_scalar(const SisoPlan& p, int64_t b, int64_t h, float* __r
             }
         }
         for (int64_t d = 0; d < D; ++d) {
-            o_row[d] = (acc[d] + skip * v_row[d]) * g_row[d];
+            const float y = acc[d] + skip * v_row[d];
+            if (p.gate_logits) {
+                const double z = static_cast<double>(g_row[d]);
+                o_row[d] = static_cast<float>(static_cast<double>(y) * (z / (1.0 + std::exp(-z))));
+            } else {
+                o_row[d] = y * g_row[d];
+            }
         }
         q_row += p.qs.t;
         k_row += p.ks.t;

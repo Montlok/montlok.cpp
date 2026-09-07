@@ -8,9 +8,10 @@ scalar and partial-block code paths:
 * Mamba-3 SISO layer: reference vs ``MONTLOK_CPP_FUSED=0`` (recurrence only)
   vs fused (recurrence + in_proj post-processing)
 * ManifoldHyperConnectionCPU vs Model.layers.mhc.ManifoldHyperConnection
-* RMSNormCPU / GroupedRMSNormCPU vs Model.layers.rmsnorm
+* fused RMSNorm / GroupedRMSNorm / LayerNorm / SwiGLU vs their PyTorch modules
 * MLACPU vs Model.layers.mla.MLA
-* the whole MultiAssetRDTCPU model (random weights) with and without the backend
+* fused mHC chaining, final-position attention and the whole MultiAssetRDTCPU
+  model (random weights) with and without the backend
 
 The script toggles the MONTLOK_* environment variables itself; it builds the
 extension on first use (see montlok_loader.py). Exits non-zero on failure.
@@ -38,14 +39,21 @@ from Model.config import RDTConfig  # noqa: E402
 from Model.layers.mhc import ManifoldHyperConnection  # noqa: E402
 from Model.layers.mla import MLA  # noqa: E402
 from Model.layers.rmsnorm import GroupedRMSNorm, RMSNorm  # noqa: E402
+from Model.layers.swiglu import SwiGLU  # noqa: E402
 
 from mamba3_cpu import Mamba3CPUReference  # noqa: E402
 from mhc_cpu import ManifoldHyperConnectionCPU  # noqa: E402
 from mla_cpu import MLACPU  # noqa: E402
-from rmsnorm_cpu import install_cpu_norms  # noqa: E402
+from layers_cpu import install_cpu_layers  # noqa: E402
 
 FAILURES: list[str] = []
-BACKEND_VARS = ("MONTLOK_CPP", "MONTLOK_CPP_FUSED", "MONTLOK_CPP_MHC", "MONTLOK_CPP_LAYERS")
+BACKEND_VARS = (
+    "MONTLOK_CPP",
+    "MONTLOK_CPP_FUSED",
+    "MONTLOK_CPP_MHC",
+    "MONTLOK_CPP_LAYERS",
+    "MONTLOK_CPP_TAIL",
+)
 
 
 @contextmanager
@@ -113,7 +121,14 @@ def test_mamba_layer() -> None:
 
 
 def test_mhc() -> None:
-    cases = [(4, 256, 1, 480, 20), (4, 256, 2, 37, 20), (3, 100, 1, 50, 5), (5, 33, 2, 17, 0), (1, 16, 1, 9, 3), (9, 20, 1, 6, 2)]
+    cases = [
+        (4, 256, 1, 480, 20),
+        (4, 256, 2, 37, 20),
+        (3, 100, 1, 50, 5),
+        (5, 33, 2, 17, 0),
+        (1, 16, 1, 9, 3),
+        (9, 20, 1, 6, 2),
+    ]
     for n, d, batch, length, iters in cases:
         torch.manual_seed(11)
         hc = ManifoldHyperConnectionCPU(d, n_streams=n, sinkhorn_iters=iters).eval()
@@ -139,34 +154,162 @@ def test_mhc() -> None:
             with backend(MONTLOK_CPP="1", MONTLOK_CPP_MHC="0"):
                 disabled = hc(streams, fn)
         report(f"mhc n{n} d{d} B{batch} L{length} iters{iters}", actual, expected, 1e-5)
-        report(f"mhc n{n} d{d} B{batch} L{length} MONTLOK_CPP_MHC=0 passthrough", disabled, expected, 0.0)
+        report(
+            f"mhc n{n} d{d} B{batch} L{length} MONTLOK_CPP_MHC=0 passthrough",
+            disabled,
+            expected,
+            0.0,
+        )
+        n_last = min(5, length)
+        with torch.inference_mode():
+            with backend(MONTLOK_CPP="1"):
+                tail = hc.forward_tail(streams, lambda agg: fn(agg)[:, -n_last:], n_last)
+            with backend(MONTLOK_CPP="1", MONTLOK_CPP_MHC="0"):
+                tail_disabled = hc.forward_tail(streams, lambda agg: fn(agg)[:, -n_last:], n_last)
+        report(
+            f"mhc n{n} d{d} B{batch} L{length} tail{n_last}",
+            tail,
+            expected[:, -n_last:],
+            1e-5,
+        )
+        report(
+            f"mhc n{n} d{d} B{batch} L{length} tail{n_last} fallback",
+            tail_disabled,
+            expected[:, -n_last:],
+            1e-5,
+        )
 
 
-def test_rms_norm() -> None:
+def test_mhc_chain() -> None:
+    """Exercise broadcast prepare, fused write/read and fused final collapse."""
+    torch.manual_seed(12)
+    n, d, batch, length = 4, 64, 2, 19
+    first = ManifoldHyperConnectionCPU(d, n_streams=n, sinkhorn_iters=7).eval()
+    second = ManifoldHyperConnectionCPU(d, n_streams=n, sinkhorn_iters=7).eval()
+    for hc in (first, second):
+        with torch.no_grad():
+            for alpha in (hc.pre_alpha, hc.post_alpha, hc.res_alpha):
+                alpha.fill_(0.6)
+            hc.res_bias.add_(torch.randn_like(hc.res_bias))
+            for linear in (hc.pre_proj, hc.post_proj, hc.res_proj):
+                linear.weight.mul_(3.0)
+
+    backbone = torch.randn(batch, length, d)
+    expanded = backbone.unsqueeze(-2).expand(-1, -1, n, -1).contiguous()
+    mix1 = torch.randn(d, d) / d**0.5
+    mix2 = torch.randn(d, d) / d**0.5
+    with torch.inference_mode(), backend(MONTLOK_CPP="1"):
+        broadcast_streams, broadcast_prepared = first._prepare(backbone, allow_broadcast=True)
+        dense_streams, dense_prepared = first._prepare(expanded)
+        for index, (broadcast_value, dense_value) in enumerate(zip(broadcast_prepared, dense_prepared, strict=True)):
+            report(
+                f"mhc broadcast prepare output {index}",
+                broadcast_value,
+                dense_value,
+                0.0,
+            )
+
+        out1 = torch.tanh(broadcast_prepared[0] @ mix1)
+        fused_streams, fused_prepared = first._combine_prepare(
+            broadcast_streams,
+            broadcast_prepared,
+            out1,
+            second,
+        )
+        separate_streams = first._combine(broadcast_streams, broadcast_prepared, out1)
+        separate_streams, separate_prepared = second._prepare(separate_streams)
+        report("mhc combine_prepare streams", fused_streams, separate_streams, 0.0)
+        for index, (fused_value, separate_value) in enumerate(zip(fused_prepared, separate_prepared, strict=True)):
+            report(f"mhc combine_prepare output {index}", fused_value, separate_value, 0.0)
+
+        out2 = torch.tanh(fused_prepared[0] @ mix2)
+        collapsed = second._combine_collapse(fused_streams, fused_prepared, out2)
+        materialized = second._combine(fused_streams, fused_prepared, out2)
+        report(
+            "mhc combine_collapse",
+            collapsed,
+            materialized.double().mean(dim=-2).float(),
+            3e-7,
+        )
+
+
+def test_cpu_layers() -> None:
     torch.manual_seed(13)
     cases = [
         ("RMSNorm [2,37,256]", RMSNorm(256, eps=1e-6), torch.randn(2, 37, 256) * 3),
         ("RMSNorm [480,256]", RMSNorm(256, eps=1e-5), torch.randn(480, 256)),
-        ("GroupedRMSNorm g8 [1,480,256]", GroupedRMSNorm(256, 8, eps=1e-6), torch.randn(1, 480, 256)),
-        ("GroupedRMSNorm g4 [3,5,100]", GroupedRMSNorm(100, 4, eps=1e-6), torch.randn(3, 5, 100)),
-        ("RMSNorm strided input [37,2,64]->transposed", RMSNorm(64, eps=1e-6), torch.randn(64, 37).t()),
+        (
+            "GroupedRMSNorm g8 [1,480,256]",
+            GroupedRMSNorm(256, 8, eps=1e-6),
+            torch.randn(1, 480, 256),
+        ),
+        (
+            "GroupedRMSNorm g4 [3,5,100]",
+            GroupedRMSNorm(100, 4, eps=1e-6),
+            torch.randn(3, 5, 100),
+        ),
+        (
+            "RMSNorm strided input [37,2,64]->transposed",
+            RMSNorm(64, eps=1e-6),
+            torch.randn(64, 37).t(),
+        ),
+        (
+            "LayerNorm [2,37,64]",
+            nn.LayerNorm(64, eps=1e-5),
+            torch.randn(2, 37, 64) * 2 + 0.5,
+        ),
+        (
+            "LayerNorm no bias, strided [37,64]",
+            nn.LayerNorm(64, eps=1e-5, bias=False),
+            torch.randn(64, 37).t(),
+        ),
+        (
+            "LayerNorm multidimensional fallback",
+            nn.LayerNorm((4, 8)),
+            torch.randn(3, 4, 8),
+        ),
     ]
     for name, norm, x in cases:
         norm = norm.eval()
         with torch.no_grad():
-            norm.weight.mul_(torch.rand_like(norm.weight) + 0.5)
+            if norm.weight is not None:
+                norm.weight.mul_(torch.rand_like(norm.weight) + 0.5)
+            if getattr(norm, "bias", None) is not None:
+                norm.bias.add_(torch.randn_like(norm.bias) * 0.25)
         holder = nn.Sequential(norm)
         with torch.inference_mode():
             expected = holder(x)
-            swapped = install_cpu_norms(holder)
+            swapped = install_cpu_layers(holder)
+            swapped_again = install_cpu_layers(holder)
             with backend(MONTLOK_CPP="1"):
                 actual = holder(x)
             with backend(MONTLOK_CPP="1", MONTLOK_CPP_LAYERS="0"):
                 disabled = holder(x)
+        if swapped != 1 or swapped_again != 0:
+            FAILURES.append(name + " install")
+            print(f"{name}: install_cpu_layers swaps {swapped}, then {swapped_again} (expected 1, then 0) FAIL")
+        report(name, actual, expected, 3e-6 * (1.0 + float(expected.abs().max())))
+        report(name + " MONTLOK_CPP_LAYERS=0 passthrough", disabled, expected, 0.0)
+
+    for d_model, hidden, shape, bias in (
+        (64, 100, (2, 37, 64), True),
+        (33, 51, (3, 11, 33), False),
+    ):
+        layer = SwiGLU(d_model, hidden, bias=bias).eval()
+        x = torch.randn(*shape)
+        holder = nn.Sequential(layer)
+        with torch.inference_mode():
+            expected = holder(x)
+            swapped = install_cpu_layers(holder)
+            with backend(MONTLOK_CPP="1"):
+                actual = holder(x)
+            with backend(MONTLOK_CPP="1", MONTLOK_CPP_LAYERS="0"):
+                disabled = holder(x)
+        name = f"SwiGLU d{d_model} hidden{hidden} bias{int(bias)}"
         if swapped != 1:
             FAILURES.append(name + " install")
-            print(f"{name}: install_cpu_norms swapped {swapped} modules (expected 1) FAIL")
-        report(name, actual, expected, 2e-6 * (1.0 + float(expected.abs().max())))
+            print(f"{name}: install_cpu_layers swapped {swapped} modules (expected 1) FAIL")
+        report(name, actual, expected, 3e-6 * (1.0 + float(expected.abs().max())))
         report(name + " MONTLOK_CPP_LAYERS=0 passthrough", disabled, expected, 0.0)
 
 
@@ -182,20 +325,48 @@ def test_mla() -> None:
         x = torch.randn(batch, length, cfg.d_model)
         with torch.inference_mode():
             expected = MLA.forward(mla, x)
+            expected_noncausal = MLA.forward(mla, x, causal=False)
             with backend(MONTLOK_CPP="1"):
                 actual = mla(x)
                 again = mla(x)  # second call uses the cached rope tables
+                noncausal = mla(x, causal=False)
+                last = mla.forward_last(x)
+                n_last = min(5, length)
+                trailing = mla.forward_last(x, n_last)
             with backend(MONTLOK_CPP="1", MONTLOK_CPP_LAYERS="0"):
                 disabled = mla(x)
+                trailing_disabled = mla.forward_last(x, n_last)
         name = f"mla heads{cfg.n_heads} hd{cfg.head_dim} B{batch} L{length}"
         tol = 4e-6 * (1.0 + float(expected.abs().max()))
         report(name, actual, expected, tol)
         report(name + " cached tables", again, actual, 0.0)
+        report(name + " noncausal", noncausal, expected_noncausal, tol)
+        report(name + " last query", last, expected[:, -1:], tol)
+        report(name + f" trailing {n_last} queries", trailing, expected[:, -n_last:], tol)
+        report(
+            name + f" trailing {n_last} fallback",
+            trailing_disabled,
+            expected[:, -n_last:],
+            0.0,
+        )
         report(name + " MONTLOK_CPP_LAYERS=0 passthrough", disabled, expected, 0.0)
+
+        with torch.no_grad():
+            mla.kv_down.weight.add_(0.01)
+        with torch.inference_mode():
+            expected_updated = MLA.forward(mla, x)
+            with backend(MONTLOK_CPP="1"):
+                actual_updated = mla(x)
+        report(
+            name + " projection cache invalidation",
+            actual_updated,
+            expected_updated,
+            tol,
+        )
 
 
 def test_full_model() -> None:
-    from model_cpu import MultiAssetRDTCPU
+    from model_cpu import MultiAssetRDTCPU, fused_stage2
 
     config = load_config()
     torch.manual_seed(0)
@@ -213,22 +384,70 @@ def test_full_model() -> None:
 
     def run():
         with torch.inference_mode():
-            quantiles, _ = model(crypto, 4, "crypto")
+            quantiles, hidden_rms = model(crypto, 4, "crypto")
             hidden, _ = model.encode(crypto, 4)
-            stock, _ = model(equities, 4, "equity_daily", assets)
-        return quantiles, hidden, stock
+            stock, stock_hidden_rms = model(equities, 4, "equity_daily", assets)
+        return quantiles, hidden_rms, hidden, stock, stock_hidden_rms
 
     with backend():
-        q_ref, h_ref, s_ref = run()
+        q_ref, rms_ref, h_ref, s_ref, stock_rms_ref = run()
+    with backend(MONTLOK_CPP="1", MONTLOK_CPP_TAIL="0"):
+        q_full, rms_full, h_full, s_full, stock_rms_full = run()
     with backend(MONTLOK_CPP="1"):
-        q_cpp, h_cpp, s_cpp = run()
+        q_tail, rms_tail, h_tail_encode, s_tail, stock_rms_tail = run()
+        with torch.inference_mode():
+            embedded = model.input_norm(model.projection(crypto.float()))
+            backbone = model.recurrent._run_stage1(
+                embedded,
+                word_pos=None,
+                morph_depth=None,
+                attn_mask=None,
+                causal=True,
+            )
+            applications = [layer for _ in range(4) for layer in model.recurrent.stage2]
+            fused_full_hidden = fused_stage2(applications, backbone)
+            fused_tail_hidden = fused_stage2(applications, backbone, 1)
     with backend(MONTLOK_CPP="1", MONTLOK_CPP_MHC="0", MONTLOK_CPP_LAYERS="0"):
-        q_mamba, h_mamba, _ = run()
-    report("full model hidden states (all fused ops)", h_cpp, h_ref, 1e-4 * (1.0 + float(h_ref.abs().max())))
-    report("full model crypto quantiles (all fused ops)", q_cpp, q_ref, 1e-5 * (1.0 + float(q_ref.abs().max())))
-    report("full model equity quantiles (all fused ops)", s_cpp, s_ref, 1e-5 * (1.0 + float(s_ref.abs().max())))
-    report("full model hidden states (Mamba kernel only)", h_mamba, h_ref, 1e-4 * (1.0 + float(h_ref.abs().max())))
-    report("full model crypto quantiles (Mamba kernel only)", q_mamba, q_ref, 1e-5 * (1.0 + float(q_ref.abs().max())))
+        q_mamba, _rms_mamba, h_mamba, _s_mamba, _stock_rms_mamba = run()
+    hidden_tol = 1e-4 * (1.0 + float(h_ref.abs().max()))
+    quantile_tol = 1e-5 * (1.0 + float(q_ref.abs().max()))
+    stock_tol = 1e-5 * (1.0 + float(s_ref.abs().max()))
+    report("full model hidden states (all fused ops)", h_full, h_ref, hidden_tol)
+    report("full model crypto quantiles (full fused ops)", q_full, q_ref, quantile_tol)
+    report("full model crypto quantiles (tail fused chain)", q_tail, q_ref, quantile_tol)
+    report("full model crypto tail vs full C++", q_tail, q_full, quantile_tol)
+    report("full model equity quantiles (full fused ops)", s_full, s_ref, stock_tol)
+    report("full model equity quantiles (tail fused chain)", s_tail, s_ref, stock_tol)
+    report(
+        "full model full hidden fused chain",
+        fused_full_hidden,
+        h_tail_encode,
+        hidden_tol,
+    )
+    report(
+        "full model tail hidden fused chain",
+        fused_tail_hidden,
+        h_tail_encode[:, -1:],
+        hidden_tol,
+    )
+    report("full model full hidden RMS", rms_full, rms_ref, hidden_tol)
+    report(
+        "full model tail hidden RMS",
+        rms_tail,
+        h_tail_encode[:, -1:].detach().float().square().mean().sqrt(),
+        hidden_tol,
+    )
+    report("full model stock full hidden RMS", stock_rms_full, stock_rms_ref, hidden_tol)
+    if not torch.isfinite(stock_rms_tail):
+        FAILURES.append("full model stock tail hidden RMS")
+        print("full model stock tail hidden RMS is not finite FAIL")
+    report(
+        "full model hidden states (Mamba kernel only)",
+        h_mamba,
+        h_ref,
+        1e-4 * (1.0 + float(h_ref.abs().max())),
+    )
+    report("full model crypto quantiles (Mamba kernel only)", q_mamba, q_ref, quantile_tol)
 
 
 def main() -> int:
@@ -237,7 +456,14 @@ def main() -> int:
 
     info = load_montlok().build_info()
     print(f"montlok extension: {info}")
-    for test in (test_mamba_layer, test_mhc, test_rms_norm, test_mla, test_full_model):
+    for test in (
+        test_mamba_layer,
+        test_mhc,
+        test_mhc_chain,
+        test_cpu_layers,
+        test_mla,
+        test_full_model,
+    ):
         print(f"--- {test.__name__}")
         test()
     if FAILURES:
