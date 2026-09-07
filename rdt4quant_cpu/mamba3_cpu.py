@@ -3,6 +3,17 @@
 Copyright 2026 OpenAI. Modified implementation derived from the Apache-2.0
 Mamba-3 reference formulas published by Dao AI Lab / GoombaLab in
 state-spaces/mamba tests/ops/triton/test_mamba3_siso.py.
+
+Backends (selected per call from the environment, see :func:`cpp_backend`):
+
+``MONTLOK_CPP`` unset
+    Pure PyTorch quadratic reference; the numerical oracle for the tests.
+``MONTLOK_CPP=1``
+    Fused montlok.cpp forward: one C++ op between ``in_proj`` and ``out_proj``
+    (BCNorm, biases, dt/A/trap, rotary cumsum, recurrence, gating).
+``MONTLOK_CPP=1 MONTLOK_CPP_FUSED=0``
+    PyTorch pre-processing + the vectorised C++ recurrence only. Debug ladder
+    for isolating a mismatch between the fused pre-processing and the kernel.
 """
 
 from __future__ import annotations
@@ -34,13 +45,26 @@ class BCNorm(nn.Module):
         return (normalized * self.weight.float()).to(value.dtype)
 
 
+def cpp_backend() -> str | None:
+    """Return ``"fused"``, ``"recurrent"`` or ``None`` (pure PyTorch)."""
+    if os.environ.get("MONTLOK_CPP") != "1":
+        return None
+    return "recurrent" if os.environ.get("MONTLOK_CPP_FUSED") == "0" else "fused"
+
+
+def _pad_rotary_tables(cosine: torch.Tensor, sine: torch.Tensor, pairs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad cos/sin to all ``pairs`` lanes once so both q and k reuse them."""
+    if cosine.shape[-1] < pairs:
+        padding = pairs - cosine.shape[-1]
+        cosine = F.pad(cosine, (0, padding), value=1.0)
+        sine = F.pad(sine, (0, padding), value=0.0)
+    return cosine, sine
+
+
 def _rotary(value: torch.Tensor, cosine: torch.Tensor, sine: torch.Tensor) -> torch.Tensor:
     paired = value.reshape(*value.shape[:-1], -1, 2)
     left, right = paired[..., 0], paired[..., 1]
-    if cosine.shape[-1] < left.shape[-1]:
-        padding = left.shape[-1] - cosine.shape[-1]
-        cosine = F.pad(cosine, (0, padding), value=1.0)
-        sine = F.pad(sine, (0, padding), value=0.0)
+    cosine, sine = _pad_rotary_tables(cosine, sine, left.shape[-1])
     return torch.stack((left * cosine - right * sine, left * sine + right * cosine), dim=-1).reshape_as(value)
 
 
@@ -114,6 +138,38 @@ class Mamba3CPUReference(nn.Module):
             raise ValueError("Mamba3CPUReference expects [batch, length, d_model]")
         batch, length, _ = inputs.shape
         projected = self.in_proj(inputs.float())
+        backend = cpp_backend()
+        if backend == "fused":
+            output = self._forward_fused(projected)
+        else:
+            output = self._forward_split(projected, batch, length, backend).reshape(batch, length, self.d_inner)
+        return self.out_proj(output.to(self.out_proj.weight.dtype))
+
+    def _forward_fused(self, projected: torch.Tensor) -> torch.Tensor:
+        """Single montlok.cpp op from the in_proj output to the out_proj input."""
+        from montlok_loader import load_montlok
+
+        gate = F.silu(projected[..., : self.d_inner])
+        return load_montlok().mamba3_siso_forward(
+            projected,
+            gate,
+            self.B_bias,
+            self.C_bias,
+            self.B_norm.weight,
+            self.C_norm.weight,
+            self.dt_bias,
+            self.D,
+            self.d_state,
+            self.num_bc_heads,
+            self.nheads,
+            self.headdim,
+            self.num_rope_angles,
+            self.B_norm.eps,
+            self.C_norm.eps,
+            self.A_floor,
+        )
+
+    def _forward_split(self, projected: torch.Tensor, batch: int, length: int, backend: str | None) -> torch.Tensor:
         z, x, b_value, c_value, raw_dt, raw_a, raw_trap, raw_angles = torch.split(
             projected,
             [
@@ -132,49 +188,52 @@ class Mamba3CPUReference(nn.Module):
         x = x.reshape(batch, length, self.nheads, self.headdim)
         b_value = self.B_norm(b_value.reshape(batch, length, self.num_bc_heads, self.d_state))
         c_value = self.C_norm(c_value.reshape(batch, length, self.num_bc_heads, self.d_state))
-        if self.num_bc_heads != self.nheads:
-            if self.nheads % self.num_bc_heads:
-                raise ValueError("nheads must be divisible by grouped B/C heads")
-            repeats = self.nheads // self.num_bc_heads
-            b_value = b_value.repeat_interleave(repeats, dim=2)
-            c_value = c_value.repeat_interleave(repeats, dim=2)
-        q_unrotated = c_value + self.C_bias.squeeze(1).view(1, 1, self.nheads, self.d_state)
-        k_unrotated = b_value + self.B_bias.squeeze(1).view(1, 1, self.nheads, self.d_state)
+        if self.nheads % self.num_bc_heads:
+            raise ValueError("nheads must be divisible by grouped B/C heads")
+        # Grouped B/C are broadcast against the per-head biases instead of being
+        # materialised with repeat_interleave; head h reads group h // repeats.
+        repeats = self.nheads // self.num_bc_heads
+        b_value = b_value.unsqueeze(3)
+        c_value = c_value.unsqueeze(3)
+        bias_shape = (1, 1, self.num_bc_heads, repeats, self.d_state)
+        q_unrotated = (c_value + self.C_bias.view(bias_shape)).reshape(batch, length, self.nheads, self.d_state)
+        k_unrotated = (b_value + self.B_bias.view(bias_shape)).reshape(batch, length, self.nheads, self.d_state)
         dt = F.softplus(raw_dt.float() + self.dt_bias.float())
         a_value = -heavy_tail_activation(raw_a.float()).clamp_min(self.A_floor)
         adt = a_value * dt
         angles = torch.tanh(raw_angles.float()).unsqueeze(2).expand(-1, -1, self.nheads, -1) * math.pi
         cumulative = torch.cumsum(angles * dt.unsqueeze(-1), dim=1)
         cumulative = cumulative - 2 * math.pi * torch.floor(cumulative / (2 * math.pi))
-        q_value = _rotary(q_unrotated, torch.cos(cumulative), torch.sin(cumulative))
-        k_value = _rotary(k_unrotated, torch.cos(cumulative), torch.sin(cumulative))
+        cosine, sine = _pad_rotary_tables(torch.cos(cumulative), torch.sin(cumulative), self.d_state // 2)
+        q_value = _rotary(q_unrotated, cosine, sine)
+        k_value = _rotary(k_unrotated, cosine, sine)
+        if backend == "recurrent":
+            from montlok_loader import load_montlok
+
+            # Strided [B, L, H, *] views are consumed directly; only the gate
+            # z * sigmoid(z) is materialised (vectorised silu, one op).
+            return load_montlok().mamba3_siso_recurrent(
+                q_value,
+                k_value,
+                x,
+                F.silu(z),
+                adt,
+                dt,
+                raw_trap,
+                self.D,
+            )
         trap = torch.sigmoid(raw_trap.float())
         shifted_dt = F.pad(dt[:, 1:].transpose(1, 2), (0, 1)).transpose(1, 2)
         shifted_trap = F.pad(trap[:, 1:].transpose(1, 2), (0, 1)).transpose(1, 2)
         shifted_gamma = shifted_dt * (1 - shifted_trap)
         scale = dt * trap + shifted_gamma
-        if os.environ.get("MONTLOK_CPP") == "1":
-            from montlok_loader import load_montlok
-
-            output = load_montlok().mamba3_siso_recurrent(
-                q_value.float().contiguous(),
-                k_value.float().contiguous(),
-                x.float().contiguous(),
-                adt.transpose(1, 2).float().contiguous(),
-                dt.transpose(1, 2).float().contiguous(),
-                raw_trap.transpose(1, 2).float().contiguous(),
-                self.D.float().contiguous(),
-                z.float().contiguous(),
-            )
-        else:
-            qk_skip = (q_unrotated * k_unrotated).sum(dim=-1) * shifted_gamma
-            k_scaled = k_value * scale.unsqueeze(-1)
-            qk = torch.einsum("bthd,bshd->bhts", q_value, k_scaled)
-            decay = torch.exp(_segment_sum(adt.transpose(1, 2)))
-            causal = torch.tril(torch.ones(length, length, device=inputs.device, dtype=torch.bool))
-            qk = qk.masked_fill(~causal, 0) * decay
-            output = torch.einsum("bhts,bshd->bthd", qk, x)
-            output = output + self.D.float().view(1, 1, self.nheads, 1) * x
-            output = output - x * qk_skip.unsqueeze(-1)
-            output = output * z * torch.sigmoid(z)
-        return self.out_proj(output.reshape(batch, length, self.d_inner).to(self.out_proj.weight.dtype))
+        qk_skip = (q_unrotated * k_unrotated).sum(dim=-1) * shifted_gamma
+        k_scaled = k_value * scale.unsqueeze(-1)
+        qk = torch.einsum("bthd,bshd->bhts", q_value, k_scaled)
+        decay = torch.exp(_segment_sum(adt.transpose(1, 2)))
+        causal = torch.tril(torch.ones(length, length, device=projected.device, dtype=torch.bool))
+        qk = qk.masked_fill(~causal, 0) * decay
+        output = torch.einsum("bhts,bshd->bthd", qk, x)
+        output = output + self.D.float().view(1, 1, self.nheads, 1) * x
+        output = output - x * qk_skip.unsqueeze(-1)
+        return output * z * torch.sigmoid(z)

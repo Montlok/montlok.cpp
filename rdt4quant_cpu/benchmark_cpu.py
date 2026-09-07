@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load an official RDT checkpoint with the CPU reference and benchmark it."""
+"""Benchmark an RDT4quant checkpoint on CPU and check its outputs against a fixture."""
 
 from __future__ import annotations
 
@@ -27,13 +27,31 @@ def main() -> None:
     parser.add_argument("--data-manifest", type=Path)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--threads", type=int, default=32)
-    parser.add_argument("--compile-transformer", action="store_true")
+    parser.add_argument(
+        "--compile-transformer",
+        action="store_true",
+        help="torch.compile the stage-2 layer (slower than eager once MONTLOK_CPP=1 fused ops are active)",
+    )
+    parser.add_argument(
+        "--no-flush-denormal",
+        action="store_true",
+        help="keep IEEE denormals (default enables FTZ/DAZ, which avoids ~100x slow paths on decaying states)",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
+    if not args.no_flush_denormal:
+        torch.set_flush_denormal(True)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from mamba3_cpu import cpp_backend
     from model_cpu import MultiAssetRDTCPU
+
+    montlok_build = None
+    if cpp_backend() is not None:
+        from montlok_loader import load_montlok
+
+        montlok_build = load_montlok().build_info()
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = json.loads(args.base_config.read_text())
@@ -68,6 +86,10 @@ def main() -> None:
         "device": "cpu",
         "threads": args.threads,
         "compiled_transformer": args.compile_transformer,
+        "flush_denormal": not args.no_flush_denormal,
+        "montlok_backend": cpp_backend(),
+        "montlok_build": montlok_build,
+        "montlok_env": {name: os.environ.get(name) for name in ("MONTLOK_CPP_FUSED", "MONTLOK_CPP_MHC", "MONTLOK_CPP_LAYERS", "MONTLOK_SERIAL_WORK")},
         "checkpoint_sha256": sha256(args.checkpoint),
         "fixture_sha256": sha256(args.fixture),
         "data_manifest_sha256": sha256(args.data_manifest) if args.data_manifest else None,
@@ -78,7 +100,6 @@ def main() -> None:
         "p95_ms": float(np.quantile(times, 0.95)),
         "max_abs_bps_difference_vs_official_cuda": float(difference.max()),
         "prediction": prediction.tolist(),
-        "orders_sent": False,
     }
     serialized = json.dumps(report, allow_nan=False)
     if args.output:

@@ -21,10 +21,14 @@ def main() -> None:
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--threads", type=int, default=32)
+    parser.add_argument("--no-flush-denormal", action="store_true", help="keep IEEE denormals (default enables FTZ/DAZ)")
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
+    if not args.no_flush_denormal:
+        torch.set_flush_denormal(True)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from mamba3_cpu import cpp_backend
     from model_cpu import MultiAssetRDTCPU
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
@@ -51,6 +55,7 @@ def main() -> None:
 
     for index, layer in enumerate(model.recurrent.stage1):
         attach(f"mamba_block_{index}", layer)
+        attach(f"mamba_block_{index}_mixer", layer.mamba.mamba)
     transformer = model.recurrent.stage2[0]
     attach("transformer_layer_total", transformer)
     attach("transformer_attention", transformer.attn)
@@ -68,10 +73,11 @@ def main() -> None:
             totals.append((time.perf_counter() - start) * 1000)
     report = {
         "iterations": args.iterations,
+        "threads": args.threads,
+        "montlok_backend": cpp_backend(),
         "full_model_p50_ms": float(np.quantile(totals, 0.5)),
         "components_mean_total_ms": {name: times[name] / args.iterations for name in sorted(times)},
         "calls_per_inference": {name: calls[name] / args.iterations for name in sorted(calls)},
-        "orders_sent": False,
     }
     print(json.dumps(report, allow_nan=False), flush=True)
 

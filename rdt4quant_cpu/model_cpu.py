@@ -20,10 +20,19 @@ from Model.layers.rmsnorm import RMSNorm  # noqa: E402
 import Model.layers.mamba3_layer as mamba_layer  # noqa: E402
 
 from mamba3_cpu import Mamba3CPUReference  # noqa: E402
+from mhc_cpu import ManifoldHyperConnectionCPU  # noqa: E402
+from mla_cpu import MLACPU  # noqa: E402
+from rmsnorm_cpu import install_cpu_norms  # noqa: E402
 
 mamba_layer.OfficialMamba3 = Mamba3CPUReference
 
+import Model.two_stage as two_stage  # noqa: E402
 from Model.two_stage import TwoStageCore  # noqa: E402
+
+# Stage-2 layers build their hyper-connections and attention from these
+# module-level names; the CPU subclasses keep the upstream parameters.
+two_stage.ManifoldHyperConnection = ManifoldHyperConnectionCPU
+two_stage.MLA = MLACPU
 
 
 class RDT4QuantCPU(nn.Module):
@@ -31,16 +40,21 @@ class RDT4QuantCPU(nn.Module):
         super().__init__()
         self.cfg = RDTConfig(**config["model"])
         if not self.cfg.use_official_mamba:
-            raise ValueError("CPU deployment expects an official-Mamba3-trained checkpoint")
+            raise ValueError("the CPU runtime requires a checkpoint trained with use_official_mamba=True")
         self.projection = nn.Linear(n_features, self.cfg.d_model)
         self.input_norm = nn.LayerNorm(self.cfg.d_model)
         self.prelude, self.coda = nn.ModuleList(), nn.ModuleList()
         self.recurrent = TwoStageCore(self.cfg)
         if any(not isinstance(layer.mamba.mamba, Mamba3CPUReference) for layer in self.recurrent.stage1):
             raise RuntimeError("CPU reference backend was not installed explicitly")
+        if self.cfg.recurrent_drift_mode == "mhc" and any(
+            not isinstance(layer.attn_hc, ManifoldHyperConnectionCPU) for layer in self.recurrent.stage2
+        ):
+            raise RuntimeError("CPU mHC backend was not installed explicitly")
         self.final_norm = RMSNorm(self.cfg.d_model, eps=self.cfg.rmsnorm_eps)
         self.head = nn.Linear(self.cfg.d_model, len(config["horizons_minutes"]) * 3)
         self.n_horizons = len(config["horizons_minutes"])
+        install_cpu_norms(self)
 
     def encode(self, inputs: torch.Tensor, depth: int):
         embedded = self.input_norm(self.projection(inputs.float()))

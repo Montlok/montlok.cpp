@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create official CUDA predictions and CPU-reference parity evidence."""
+"""Generate a CUDA reference fixture and CPU parity report."""
 
 from __future__ import annotations
 

@@ -27,28 +27,27 @@
   "thresholds_240m": {
     "0.0": {
       "agreement": 0.9245,
-      "flips": 151,
-      "official_long": 1029,
-      "cpu_long": 986
+      "disagreements": 151,
+      "official_above": 1029,
+      "cpu_above": 986
     },
     "12.0": {
       "agreement": 0.9195,
-      "flips": 161,
-      "official_long": 739,
-      "cpu_long": 632
+      "disagreements": 161,
+      "official_above": 739,
+      "cpu_above": 632
     },
     "24.0": {
       "agreement": 0.9165,
-      "flips": 167,
-      "official_long": 508,
-      "cpu_long": 371
+      "disagreements": 167,
+      "official_above": 508,
+      "cpu_above": 371
     },
     "40.0": {
       "agreement": 0.9435,
-      "flips": 113,
-      "official_long": 321,
-      "cpu_long": 220
+      "disagreements": 113,
+      "official_above": 321,
+      "cpu_above": 220
     }
-  },
-  "orders_sent": false
+  }
 }

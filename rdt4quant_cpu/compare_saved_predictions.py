@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare CPU reference against saved official-CUDA chronological predictions."""
+"""Compare CPU outputs with saved CUDA predictions in chronological order."""
 
 from __future__ import annotations
 
@@ -72,13 +72,13 @@ def main() -> None:
     official_median = official[:, :, 1] * scale
     thresholds = {}
     for threshold in (0.0, 12.0, 24.0, 40.0):
-        official_action = official_median[:, 2] > threshold
-        cpu_action = cpu_median[:, 2] > threshold
+        official_above = official_median[:, 2] > threshold
+        cpu_above = cpu_median[:, 2] > threshold
         thresholds[str(threshold)] = {
-            "agreement": float(np.mean(official_action == cpu_action)),
-            "flips": int(np.sum(official_action != cpu_action)),
-            "official_long": int(official_action.sum()),
-            "cpu_long": int(cpu_action.sum()),
+            "agreement": float(np.mean(official_above == cpu_above)),
+            "disagreements": int(np.sum(official_above != cpu_above)),
+            "official_above": int(official_above.sum()),
+            "cpu_above": int(cpu_above.sum()),
         }
     report = {
         "kind": "chronological_saved_official_cuda_vs_cpu_reference",
@@ -102,7 +102,6 @@ def main() -> None:
             for horizon in range(3)
         ],
         "thresholds_240m": thresholds,
-        "orders_sent": False,
     }
     args.output.mkdir(parents=True)
     (args.output / "comparison.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
