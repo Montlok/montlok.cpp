@@ -3,7 +3,8 @@
 // around the RDT stage-1/stage-2 blocks: RMSNorm / GroupedRMSNorm, LayerNorm,
 // the SwiGLU gate and the MLA rotary embedding + key assembly.
 //
-// Torch-free like montlok_kernel.h. These exist purely to cut operator count:
+// Torch-free like montlok_kernel.h (and, like it, compiled once per
+// instruction set through montlok_isa.h). These exist purely to cut operator count:
 // in eager PyTorch an RMSNorm is seven tiny ops (float, pow, mean, add, rsqrt,
 // mul, mul), a SwiGLU gate is two (silu, mul) and the MLA key path is ~15
 // (split, two rotate_half cats, four muls, expand, cat, ...); with 12-32
@@ -15,6 +16,7 @@
 #include "montlok_mhc.h"
 
 namespace montlok {
+MONTLOK_ISA_NAMESPACE_BEGIN
 
 // out[row] = x[row] * rsqrt(mean(x[row]^2 over each group) + eps) * w, for
 // `rows` rows of `dim` floats split into `groups` equal groups.
@@ -64,6 +66,31 @@ inline void rms_norm_rows(const float* __restrict x, int64_t row_stride, const f
             }
         }
     }
+}
+
+// residual = left + right (fp32, like the PyTorch add) followed by
+// rms_norm_rows of the residual, for rows [row_begin, row_end) of `dim`
+// contiguous floats: the two halves of one residual connection in one pass
+// while the row is still in L1.
+inline void add_rms_norm_rows(const float* __restrict left, const float* __restrict right,
+                              const float* __restrict w, double eps, int64_t dim, int64_t groups,
+                              int64_t row_begin, int64_t row_end, float* __restrict residual,
+                              float* __restrict normalized) noexcept {
+    for (int64_t row = row_begin; row < row_end; ++row) {
+        const float* __restrict a = left + row * dim;
+        const float* __restrict b = right + row * dim;
+        float* __restrict out = residual + row * dim;
+        int64_t k = 0;
+#ifdef MONTLOK_VECTOR_EXT
+        for (; k + 8 <= dim; k += 8) {
+            store8(out + k, load8(a + k) + load8(b + k));
+        }
+#endif
+        for (; k < dim; ++k) {
+            out[k] = a[k] + b[k];
+        }
+    }
+    rms_norm_rows(residual, dim, w, eps, dim, groups, row_begin, row_end, normalized);
 }
 
 // SwiGLU gate for `rows` rows: out[row, k] = silu(x[row, k]) * x[row, hidden + k]
@@ -182,26 +209,6 @@ inline void rope_vector(const float* x, const float* __restrict cosine, const fl
 // Queries may cover only the trailing `q_length` positions of each sequence
 // (q_length == length for the full forward); keys are always assembled for
 // every token.
-struct MlaRopePlan {
-    float* q;             // [batch, q_length, heads, head_dim] (strides below)
-    int64_t q_token_stride;
-    int64_t q_head_stride;
-    int64_t q_length;     // queries are positions [length - q_length, length)
-    const float* kv;      // [tokens, heads, nope + head_dim]
-    int64_t kv_token_stride;
-    int64_t kv_head_stride;
-    const float* k_rope;  // [tokens, rope_dim]
-    int64_t k_rope_token_stride;
-    const float* cosine;  // [positions, rope_dim] contiguous, position = token % length
-    const float* sine;
-    float* k;             // [tokens, heads, head_dim] contiguous output
-    int64_t length;
-    int64_t heads;
-    int64_t head_dim;
-    int64_t nope_dim;
-    int64_t rope_dim;
-};
-
 inline void mla_rope_token(const MlaRopePlan& p, int64_t token, float* __restrict scratch) noexcept {
     const int64_t position = token % p.length;
     const int64_t sequence = token / p.length;
@@ -223,4 +230,12 @@ inline void mla_rope_token(const MlaRopePlan& p, int64_t token, float* __restric
     }
 }
 
+// mla_rope_token for tokens [begin, end); `scratch` holds rope_dim floats.
+inline void mla_rope_range(const MlaRopePlan& p, int64_t begin, int64_t end, float* __restrict scratch) noexcept {
+    for (int64_t token = begin; token < end; ++token) {
+        mla_rope_token(p, token, scratch);
+    }
+}
+
+MONTLOK_ISA_NAMESPACE_END
 }  // namespace montlok

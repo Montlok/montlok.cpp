@@ -3,7 +3,8 @@
 // The recurrence follows the public state-spaces/mamba reference equations.
 //
 // PyTorch bindings around the torch-free kernels in montlok_kernel.h,
-// montlok_mhc.h and montlok_layers.h:
+// montlok_mhc.h and montlok_layers.h (compiled once per instruction set and
+// selected at run time, see montlok_isa.h):
 //   mamba3_siso_recurrent  vectorised recurrence over prepared q/k/v/gate
 //   mamba3_siso_forward    fused in_proj-output -> pre-out_proj forward
 //   mhc_prepare            mHC coefficients + aggregated input for one residual
@@ -13,7 +14,9 @@
 //   rms_norm, layer_norm   (Grouped)RMSNorm / LayerNorm in one op
 //   swiglu                 silu(gate) * up in one op
 //   mla_rope_qk            MLA rotary embedding of q (in place) + key assembly
-//   build_info             which SIMD path this build compiled to
+//   build_info             compiler, kernel variant and dispatch details of this build
+//   isa_variants, active_isa, set_isa, cpu_features
+//                          the compiled kernel variants and the runtime choice between them
 
 #include <torch/extension.h>
 #include <ATen/Parallel.h>
@@ -24,6 +27,7 @@
 #include <ATen/ops/scaled_dot_product_attention.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -31,9 +35,8 @@
 #include <tuple>
 #include <vector>
 
-#include "montlok_kernel.h"
-#include "montlok_layers.h"
-#include "montlok_mhc.h"
+#include "montlok_isa.h"
+#include "montlok_types.h"
 
 namespace {
 
@@ -87,17 +90,42 @@ torch::Tensor linear_dispatch(
     return std::move(stack.back()).toTensor();
 }
 
-// Runs fn(begin, end) over [0, items) on torch's intra-op thread pool.
+// ---------------------------------------------------------------------------
+// Kernel variant and work distribution
+// ---------------------------------------------------------------------------
+
+// The instruction-set variant chosen for this process (montlok_isa.h): cpuid
+// picks the best of baseline / AVX2 / AVX-512 on first use; MONTLOK_ISA or
+// set_isa() override it.
+const montlok::KernelTable& kernels() {
+    return montlok::active_kernels();
+}
+
+// Runs fn(begin, end, scratch) over chunks of [0, items) on torch's intra-op
+// thread pool.
 //
-// Linux builds use -fopenmp and bind to the libgomp.so.1 already loaded by the
-// PyTorch wheel, so at::parallel_for can dispatch directly. Builds without an
-// OpenMP compiler use TensorIteratorBase::for_each as the thread-pool bridge.
-// Both paths honour torch.set_num_threads().
+// Chunks are handed out dynamically from an atomic counter rather than
+// partitioned statically: on CPUs with mixed core types (Apple M-series, Intel
+// Core since the 12th generation) or whenever the OS deschedules a thread, a
+// static split waits for the slowest thread while the dynamic one gives the
+// remaining chunks to whoever is free. `scratch` (scratch_count values of T)
+// is allocated once per worker, not per chunk.
 //
-// Small problems are run inline: a fork/join costs tens of microseconds on a
-// 16-32 thread pool, more than the arithmetic of a 480-token RMSNorm.
-// `work_per_item` is an estimate in scalar float operations; the threshold is
-// configurable with MONTLOK_SERIAL_WORK (default 150000).
+// Builds with OpenMP (Linux -fopenmp; macOS through the libomp the PyTorch
+// wheel ships) fork with at::parallel_for, binding to the OpenMP runtime that
+// libtorch_cpu already loaded. Builds without it fork through
+// TensorIteratorBase::for_each, which lives inside libtorch_cpu: its range is
+// a dummy tensor of at::internal::GRAIN_SIZE elements split into `workers`
+// chunks, so the partition depends neither on the item count nor on
+// for_each's own serial cutoff, and every chunk callback pulls workers from a
+// counter. Whether a build's OpenMP really forks is probed once
+// (`parallel_dispatch` in build_info); if it does not, the TensorIterator
+// path is used. Both honour torch.set_num_threads().
+//
+// Small problems run inline: a fork/join costs several microseconds, more
+// than the arithmetic of a 480-token RMSNorm. `work_per_item` is an estimate
+// in scalar float operations; the threshold is configurable with
+// MONTLOK_SERIAL_WORK (default 150000).
 int64_t serial_work_threshold() {
     static const int64_t threshold = [] {
         const char* env = std::getenv("MONTLOK_SERIAL_WORK");
@@ -106,56 +134,106 @@ int64_t serial_work_threshold() {
     return threshold;
 }
 
-template <typename Fn>
-void parallel_items(
-    int64_t items,
-    int64_t grain,
-    const Fn& fn,
-    int64_t work_per_item = 1 << 20,
-    const torch::Tensor& dispatch_storage = torch::Tensor()) {
+int64_t divide_up(int64_t value, int64_t divisor) {
+    return (value + divisor - 1) / divisor;
+}
+
+#ifdef _OPENMP
+// True when the at::parallel_for compiled into this extension really forks:
+// the OpenMP pragmas were honoured and the runtime is the one torch uses.
+bool openmp_forks() {
+    static const bool forks = [] {
+        const int64_t threads = at::get_num_threads();
+        if (threads <= 1) {
+            return true;
+        }
+        std::atomic<int> highest_thread{0};
+        at::parallel_for(0, threads, 1, [&](int64_t, int64_t) {
+            const int tid = at::get_thread_num();
+            int seen = highest_thread.load();
+            while (tid > seen && !highest_thread.compare_exchange_weak(seen, tid)) {
+            }
+        });
+        return highest_thread.load() > 0;
+    }();
+    return forks;
+}
+#else
+constexpr bool openmp_forks() {
+    return false;
+}
+#endif
+
+// Runs task(worker) for every worker in [0, workers), on as many threads as the
+// pool offers at once.
+template <typename Task>
+void run_workers(int64_t workers, const Task& task) {
+#ifdef _OPENMP
+    if (openmp_forks()) {
+        at::parallel_for(0, workers, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t worker = begin; worker < end; ++worker) {
+                task(worker);
+            }
+        });
+        return;
+    }
+#endif
+    // Never freed: a static Tensor destroyed at process exit can outlive the
+    // allocator. The bytes are never read.
+    static const torch::Tensor* dispatch =
+        new torch::Tensor(torch::empty({at::internal::GRAIN_SIZE}, torch::dtype(torch::kByte)));
+    auto iter = at::TensorIteratorConfig().add_output(*dispatch).add_input(*dispatch).build();
+    std::atomic<int64_t> next{0};
+    iter.for_each(
+        [&](char**, const int64_t*, int64_t) {
+            for (;;) {
+                const int64_t worker = next.fetch_add(1, std::memory_order_relaxed);
+                if (worker >= workers) {
+                    return;
+                }
+                task(worker);
+            }
+        },
+        divide_up(at::internal::GRAIN_SIZE, workers));
+}
+
+template <typename T, typename Fn>
+void parallel_items(int64_t items, int64_t grain, int64_t work_per_item, int64_t scratch_count, const Fn& fn) {
     if (items <= 0) {
         return;
     }
-    if (items * work_per_item < serial_work_threshold()) {
-        fn(0, items);
+    grain = std::max<int64_t>(grain, 1);
+    const int64_t threads = at::get_num_threads();
+    if (threads <= 1 || at::in_parallel_region() || items * work_per_item < serial_work_threshold()) {
+        std::vector<T> scratch(static_cast<size_t>(scratch_count));
+        fn(0, items, scratch.data());
         return;
     }
-#ifdef _OPENMP
-    // Linux wheels already load PyTorch's bundled libgomp.so.1. Building this
-    // extension with -fopenmp binds to that same SONAME and lets ATen dispatch
-    // directly without a TensorIterator trampoline.
-    at::parallel_for(0, items, std::max<int64_t>(grain, 1), fn);
-    return;
-#endif
-    // The tensor is never read: the chunk position comes from its pointer
-    // offset. Reuse an already allocated contiguous output whenever possible;
-    // otherwise fall back to a tiny uninitialized dispatch buffer.
-    torch::Tensor indices;
-    if (dispatch_storage.defined() && dispatch_storage.is_contiguous() && dispatch_storage.numel() >= items) {
-        indices = dispatch_storage.view({-1}).narrow(0, 0, items);
-    } else {
-        indices = torch::empty({items}, torch::dtype(torch::kLong));
-    }
-    const char* base = reinterpret_cast<const char*>(indices.data_ptr());
-    const int64_t element_size = indices.element_size();
-    auto iter = at::TensorIteratorConfig().add_output(indices).add_input(indices).build();
-    iter.for_each(
-        [&](char** data, const int64_t* /*strides*/, int64_t size) {
-            const int64_t begin = static_cast<int64_t>((data[1] - base) / static_cast<std::ptrdiff_t>(element_size));
-            fn(begin, begin + size);
-        },
-        std::max<int64_t>(grain, 1));
+    const int64_t units = divide_up(items, grain);
+    const int64_t workers = std::min<int64_t>(threads, units);
+    // About four chunks per worker: short tail, bookkeeping still invisible.
+    const int64_t chunk = std::max<int64_t>(1, divide_up(units, 4 * workers)) * grain;
+    std::atomic<int64_t> next{0};
+    run_workers(workers, [&](int64_t) {
+        std::vector<T> scratch(static_cast<size_t>(scratch_count));
+        for (;;) {
+            const int64_t begin = next.fetch_add(chunk, std::memory_order_relaxed);
+            if (begin >= items) {
+                return;
+            }
+            fn(begin, std::min(items, begin + chunk), scratch.data());
+        }
+    });
 }
 
-void run_recurrence(const montlok::SisoPlan& plan, const torch::Tensor& dispatch_storage) {
-    const int64_t items = montlok::siso_work_items(plan);
-    const int64_t scratch_floats = montlok::siso_scratch_floats(plan);
-    parallel_items(items, 1, [&](int64_t begin, int64_t end) {
-        std::vector<float> scratch(static_cast<size_t>(scratch_floats));
-        for (int64_t item = begin; item < end; ++item) {
-            montlok::siso_run_work_item(plan, item, scratch.data());
-        }
-    }, 1 << 20, dispatch_storage);
+void run_recurrence(const montlok::SisoPlan& plan) {
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(montlok::siso_work_items(plan), 1, 1 << 20, montlok::siso_scratch_floats(plan),
+                          [&](int64_t begin, int64_t end, float* scratch) {
+                              for (int64_t item = begin; item < end; ++item) {
+                                  kernel.siso_run_work_item(plan, item, scratch);
+                              }
+                          });
 }
 
 }  // namespace
@@ -206,7 +284,7 @@ torch::Tensor mamba3_siso_recurrent(
         const auto adt_acc = adt.accessor<float, 3>();
         const auto dt_acc = dt.accessor<float, 3>();
         const auto trap_acc = trap_logit.accessor<float, 3>();
-        parallel_items(batch * length * heads, 2048, [&](int64_t begin, int64_t end) {
+        parallel_items<float>(batch * length * heads, 256, 1 << 20, 0, [&](int64_t begin, int64_t end, float*) {
             for (int64_t index = begin; index < end; ++index) {
                 const int64_t h = index % heads;
                 const int64_t t = (index / heads) % length;
@@ -217,7 +295,7 @@ torch::Tensor mamba3_siso_recurrent(
                 beta[index] = coef.beta;
                 gamma[index] = coef.gamma;
             }
-        }, 1 << 20, coefficients);
+        });
     }
 
     auto output = torch::empty({batch, length, heads, value_dim}, v.options());
@@ -242,7 +320,7 @@ torch::Tensor mamba3_siso_recurrent(
     plan.skip = skip_dense.data_ptr<float>();
     plan.out = output.data_ptr<float>();
     plan.os = leading_strides(output);
-    run_recurrence(plan, output);
+    run_recurrence(plan);
     return output;
 }
 
@@ -362,24 +440,25 @@ torch::Tensor mamba3_siso_forward(
     prep.cum = cumulative.data_ptr<float>();
 
     const int64_t tokens = batch * length;
-    const int64_t prep_scratch = montlok::prep_scratch_floats(prep);
-    parallel_items(tokens, 1, [&](int64_t begin, int64_t end) {
-        std::vector<float> scratch(static_cast<size_t>(prep_scratch));
-        for (int64_t token = begin; token < end; ++token) {
-            montlok::prep_token(prep, token / length, token % length, scratch.data());
-        }
-    }, 1 << 20, q);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(tokens, 1, 1 << 20, montlok::prep_scratch_floats(prep),
+                          [&](int64_t begin, int64_t end, float* scratch) {
+                              for (int64_t token = begin; token < end; ++token) {
+                                  kernel.prep_token(prep, token / length, token % length, scratch);
+                              }
+                          });
     if (num_rope_angles > 0) {
-        parallel_items(batch * nheads * num_rope_angles, 1, [&](int64_t begin, int64_t end) {
-            for (int64_t chain = begin; chain < end; ++chain) {
-                montlok::prep_chain(prep, chain);
-            }
-        }, 1 << 20, cumulative);
-        parallel_items(tokens, 1, [&](int64_t begin, int64_t end) {
+        parallel_items<float>(batch * nheads * num_rope_angles, 1, 1 << 20, 0,
+                              [&](int64_t begin, int64_t end, float*) {
+                                  for (int64_t chain = begin; chain < end; ++chain) {
+                                      kernel.prep_chain(prep, chain);
+                                  }
+                              });
+        parallel_items<float>(tokens, 1, 1 << 20, 0, [&](int64_t begin, int64_t end, float*) {
             for (int64_t token = begin; token < end; ++token) {
-                montlok::prep_rotate(prep, token / length, token % length);
+                kernel.prep_rotate(prep, token / length, token % length);
             }
-        }, 1 << 20, q);
+        });
     }
 
     montlok::SisoPlan plan{};
@@ -408,7 +487,7 @@ torch::Tensor mamba3_siso_forward(
     plan.skip = skip_dense.data_ptr<float>();
     plan.out = output.data_ptr<float>();
     plan.os = {length * d_inner, d_inner, headdim};
-    run_recurrence(plan, output);
+    run_recurrence(plan);
     return output;
 }
 
@@ -603,11 +682,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mhc_prepa
     plan.stream_stride = view.stream_stride;
     plan.token_stride = view.token_stride;
 
-    const int64_t scratch_doubles = montlok::mhc_scratch_doubles(plan);
-    parallel_items(plan.tokens, montlok::kMhcTokenBlock, [&](int64_t begin, int64_t end) {
-        std::vector<double> scratch(static_cast<size_t>(scratch_doubles));
-        montlok::mhc_prepare_range(plan, begin, end, scratch.data());
-    }, mhc_prepare_work(view.n, view.d, plan.sinkhorn_iters), outputs.agg);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<double>(plan.tokens, montlok::kMhcTokenBlock, mhc_prepare_work(view.n, view.d, plan.sinkhorn_iters),
+                           montlok::mhc_scratch_doubles(plan), [&](int64_t begin, int64_t end, double* scratch) {
+                               kernel.mhc_prepare_range(plan, begin, end, scratch);
+                           });
     return std::make_tuple(outputs.agg, outputs.pre, outputs.post, outputs.res);
 }
 
@@ -653,9 +732,9 @@ torch::Tensor mhc_combine(
     montlok::MhcCombinePlan plan = mhc_combine_plan(view, res, post, out);
     auto new_streams = torch::empty({view.batch, view.length, view.n, view.d}, streams.options());
     plan.new_streams = new_streams.data_ptr<float>();
-    parallel_items(view.batch * view.length, 1, [&](int64_t begin, int64_t end) {
-        montlok::mhc_combine_range(plan, begin, end);
-    }, 2 * view.n * (view.n + 1) * view.d, new_streams);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(view.batch * view.length, 1, 2 * view.n * (view.n + 1) * view.d, 0,
+                          [&](int64_t begin, int64_t end, float*) { kernel.mhc_combine_range(plan, begin, end); });
     return new_streams;
 }
 
@@ -670,17 +749,11 @@ torch::Tensor mhc_combine_collapse(
     montlok::MhcCombinePlan plan = mhc_combine_plan(view, res, post, out);
     auto hidden = torch::empty({view.batch, view.length, view.d}, streams.options());
     plan.collapsed = hidden.data_ptr<float>();
-    const int64_t token_floats = view.n * view.d;
-    const int64_t n = view.n;
-    const int64_t d = view.d;
-    parallel_items(view.batch * view.length, 1, [&](int64_t begin, int64_t end) {
-        std::vector<float> scratch(static_cast<size_t>(token_floats));
-        for (int64_t token = begin; token < end; ++token) {
-            montlok::mhc_combine_token(plan.streams + token * plan.token_stride, plan.stream_stride,
-                                       plan.res + token * n * n, plan.post + token * n, plan.out + token * d,
-                                       scratch.data(), plan.collapsed + token * d, n, d);
-        }
-    }, 2 * n * (n + 1) * d, hidden);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(view.batch * view.length, 1, 2 * view.n * (view.n + 1) * view.d, view.n * view.d,
+                          [&](int64_t begin, int64_t end, float* scratch) {
+                              kernel.mhc_combine_collapse_range(plan, begin, end, scratch);
+                          });
     return hidden;
 }
 
@@ -719,12 +792,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     prepare.stream_stride = view.d;
     prepare.token_stride = view.n * view.d;
 
-    const int64_t scratch_doubles = montlok::mhc_scratch_doubles(prepare);
-    parallel_items(prepare.tokens, montlok::kMhcTokenBlock, [&](int64_t begin, int64_t end) {
-        std::vector<double> scratch(static_cast<size_t>(scratch_doubles));
-        montlok::mhc_combine_prepare_range(combine, prepare, begin, end, scratch.data());
-    }, mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
-       outputs.agg);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<double>(prepare.tokens, montlok::kMhcTokenBlock,
+                           mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
+                           montlok::mhc_scratch_doubles(prepare), [&](int64_t begin, int64_t end, double* scratch) {
+                               kernel.mhc_combine_prepare_range(combine, prepare, begin, end, scratch);
+                           });
     return std::make_tuple(new_streams, outputs.agg, outputs.pre, outputs.post, outputs.res);
 }
 
@@ -765,12 +838,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mhc_combi
     prepare.stream_stride = view.d;
     prepare.token_stride = view.n * view.d;
 
-    const int64_t scratch_doubles = montlok::mhc_scratch_doubles(prepare);
-    parallel_items(prepare.tokens, montlok::kMhcTokenBlock, [&](int64_t begin, int64_t end) {
-        std::vector<double> scratch(static_cast<size_t>(scratch_doubles));
-        montlok::mhc_combine_prepare_inplace_range(combine, prepare, begin, end, scratch.data());
-    }, mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
-       outputs.agg);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<double>(prepare.tokens, montlok::kMhcTokenBlock,
+                           mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
+                           montlok::mhc_scratch_doubles(prepare), [&](int64_t begin, int64_t end, double* scratch) {
+                               kernel.mhc_combine_prepare_inplace_range(combine, prepare, begin, end, scratch);
+                           });
     return std::make_tuple(outputs.agg, outputs.pre, outputs.post, outputs.res);
 }
 
@@ -822,16 +895,16 @@ void mhc_combine_prepare_reuse(
     prepare.stream_stride = view.d;
     prepare.token_stride = view.n * view.d;
 
-    const int64_t scratch_doubles = montlok::mhc_scratch_doubles(prepare);
-    parallel_items(prepare.tokens, montlok::kMhcTokenBlock, [&](int64_t begin, int64_t end) {
-        std::vector<double> scratch(static_cast<size_t>(scratch_doubles));
-        if (reuse_streams) {
-            montlok::mhc_combine_prepare_inplace_range(combine, prepare, begin, end, scratch.data());
-        } else {
-            montlok::mhc_combine_prepare_range(combine, prepare, begin, end, scratch.data());
-        }
-    }, mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
-       outputs.agg);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<double>(prepare.tokens, montlok::kMhcTokenBlock,
+                           mhc_prepare_work(view.n, view.d, prepare.sinkhorn_iters) + 2 * view.n * (view.n + 1) * view.d,
+                           montlok::mhc_scratch_doubles(prepare), [&](int64_t begin, int64_t end, double* scratch) {
+                               if (reuse_streams) {
+                                   kernel.mhc_combine_prepare_inplace_range(combine, prepare, begin, end, scratch);
+                               } else {
+                                   kernel.mhc_combine_prepare_range(combine, prepare, begin, end, scratch);
+                               }
+                           });
     if (!reuse_streams) {
         streams = std::move(next_streams);
     }
@@ -857,9 +930,10 @@ torch::Tensor rms_norm(const torch::Tensor& x, const torch::Tensor& weight, doub
     float* out_ptr = out.data_ptr<float>();
     // The reference adds the Python float eps to a float32 tensor.
     const double eps_f = static_cast<double>(static_cast<float>(eps));
-    parallel_items(count, 1, [&](int64_t begin, int64_t end) {
-        montlok::rms_norm_rows(x_ptr, row_stride, w_ptr, eps_f, dim, groups, begin, end, out_ptr);
-    }, 3 * dim, out);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(count, 1, 3 * dim, 0, [&](int64_t begin, int64_t end, float*) {
+        kernel.rms_norm_rows(x_ptr, row_stride, w_ptr, eps_f, dim, groups, begin, end, out_ptr);
+    });
     return out.view(x.sizes());
 }
 
@@ -879,9 +953,10 @@ torch::Tensor swiglu(const torch::Tensor& x) {
     const float* x_ptr = rows.data_ptr<float>();
     const int64_t row_stride = rows.stride(0);
     float* out_ptr = out.data_ptr<float>();
-    parallel_items(count, 1, [&](int64_t begin, int64_t end) {
-        montlok::swiglu_rows(x_ptr, row_stride, hidden, begin, end, out_ptr);
-    }, 24 * hidden, out);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(count, 1, 24 * hidden, 0, [&](int64_t begin, int64_t end, float*) {
+        kernel.swiglu_rows(x_ptr, row_stride, hidden, begin, end, out_ptr);
+    });
     std::vector<int64_t> shape(x.sizes().begin(), x.sizes().end());
     shape.back() = hidden;
     return out.view(shape);
@@ -923,23 +998,11 @@ std::tuple<torch::Tensor, torch::Tensor> add_rms_norm(
     float* residual_ptr = residual.data_ptr<float>();
     float* normalized_ptr = normalized.data_ptr<float>();
     const double eps_f = static_cast<double>(static_cast<float>(eps));
-    parallel_items(count, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t row = begin; row < end; ++row) {
-            const float* a = left_ptr + row * dim;
-            const float* b = right_ptr + row * dim;
-            float* out = residual_ptr + row * dim;
-            int64_t k = 0;
-#ifdef MONTLOK_VECTOR_EXT
-            for (; k + 8 <= dim; k += 8) {
-                montlok::store8(out + k, montlok::load8(a + k) + montlok::load8(b + k));
-            }
-#endif
-            for (; k < dim; ++k) {
-                out[k] = a[k] + b[k];
-            }
-        }
-        montlok::rms_norm_rows(residual_ptr, dim, weight_ptr, eps_f, dim, groups, begin, end, normalized_ptr);
-    }, 4 * dim, normalized);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(count, 1, 4 * dim, 0, [&](int64_t begin, int64_t end, float*) {
+        kernel.add_rms_norm_rows(left_ptr, right_ptr, weight_ptr, eps_f, dim, groups, begin, end, residual_ptr,
+                                 normalized_ptr);
+    });
     return std::make_tuple(residual.view(left.sizes()), normalized.view(left.sizes()));
 }
 
@@ -1011,9 +1074,10 @@ torch::Tensor layer_norm(const torch::Tensor& x, const torch::Tensor& weight, co
     float* out_ptr = out.data_ptr<float>();
     // The reference casts eps to the float32 accumulation type.
     const double eps_f = static_cast<double>(static_cast<float>(eps));
-    parallel_items(count, 1, [&](int64_t begin, int64_t end) {
-        montlok::layer_norm_rows(x_ptr, row_stride, w_ptr, b_ptr, eps_f, dim, begin, end, out_ptr);
-    }, 6 * dim, out);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(count, 1, 6 * dim, 0, [&](int64_t begin, int64_t end, float*) {
+        kernel.layer_norm_rows(x_ptr, row_stride, w_ptr, b_ptr, eps_f, dim, begin, end, out_ptr);
+    });
     return out.view(x.sizes());
 }
 
@@ -1081,12 +1145,11 @@ torch::Tensor mla_rope_qk(
     plan.head_dim = head_dim;
     plan.nope_dim = nope_dim;
     plan.rope_dim = rope_dim;
-    parallel_items(batch * length, 1, [&](int64_t begin, int64_t end) {
-        std::vector<float> scratch(static_cast<size_t>(rope_dim));
-        for (int64_t token = begin; token < end; ++token) {
-            montlok::mla_rope_token(plan, token, scratch.data());
-        }
-    }, heads * (head_dim + 3 * rope_dim), k);
+    const montlok::KernelTable& kernel = kernels();
+    parallel_items<float>(batch * length, 1, heads * (head_dim + 3 * rope_dim), rope_dim,
+                          [&](int64_t begin, int64_t end, float* scratch) {
+                              kernel.mla_rope_range(plan, begin, end, scratch);
+                          });
     return k;
 }
 
@@ -1295,44 +1358,89 @@ torch::Tensor stage2_tail_forward(
     return torch::Tensor();
 }
 
-py::dict build_info() {
+py::dict describe_cpu() {
+    const montlok::CpuFeatures& cpu = montlok::host_cpu();
     py::dict info;
-    info["vector_extensions"] =
-#ifdef MONTLOK_VECTOR_EXT
-        true;
-#else
-        false;
-#endif
-    info["avx2"] =
-#ifdef __AVX2__
-        true;
-#else
-        false;
-#endif
-    info["fma"] =
-#ifdef __FMA__
-        true;
-#else
-        false;
-#endif
-    info["avx512f"] =
-#ifdef __AVX512F__
-        true;
-#else
-        false;
-#endif
+    info["brand"] = std::string(cpu.brand);
+    info["arch"] = cpu.x86 ? "x86-64" : (cpu.arm64 ? "arm64" : "other");
+    info["sse2"] = cpu.sse2;
+    info["sse4_2"] = cpu.sse4_2;
+    info["avx"] = cpu.avx;
+    info["fma"] = cpu.fma;
+    info["avx2"] = cpu.avx2;
+    info["avx512f"] = cpu.avx512f;
+    info["avx512dq"] = cpu.avx512dq;
+    info["avx512bw"] = cpu.avx512bw;
+    info["avx512vl"] = cpu.avx512vl;
+    info["os_avx"] = cpu.os_avx;
+    info["os_avx512"] = cpu.os_avx512;
+    return info;
+}
+
+py::dict describe_table(const montlok::KernelTable& table) {
+    py::dict info;
+    info["name"] = std::string(table.name);
+    info["level"] = table.level;
+    info["vec_bytes"] = table.vec_bytes;
+    info["vector_extensions"] = table.vector_ext;
+    info["fma"] = table.fma;
+    info["avx2"] = table.avx2;
+    info["avx512"] = table.avx512;
+    info["supported"] = montlok::cpu_supports(montlok::host_cpu(), table);
+    return info;
+}
+
+// The kernel variants compiled into this build, lowest level first.
+py::list isa_variants() {
+    const montlok::KernelTable* tables[montlok::kMaxKernelTables];
+    const int count = montlok::available_kernels(tables, montlok::kMaxKernelTables);
+    py::list out;
+    for (int i = 0; i < count; ++i) {
+        out.append(describe_table(*tables[i]));
+    }
+    return out;
+}
+
+std::string active_isa() {
+    return kernels().name;
+}
+
+// Switches the variant for this process; force=True skips the CPU check (for
+// emulators that run instructions they do not advertise). Returns the name now in use.
+std::string set_isa(const std::string& name, bool force) {
+    char message[256] = {0};
+    const montlok::KernelTable* table = montlok::set_active_kernels(name.c_str(), force, message, sizeof(message));
+    TORCH_CHECK(table != nullptr, message);
+    return table->name;
+}
+
+py::dict build_info() {
+    const montlok::KernelTable& table = kernels();
+    py::dict info;
+    info["isa"] = std::string(table.name);
+    py::list names;
+    {
+        const montlok::KernelTable* tables[montlok::kMaxKernelTables];
+        const int count = montlok::available_kernels(tables, montlok::kMaxKernelTables);
+        for (int i = 0; i < count; ++i) {
+            names.append(std::string(tables[i]->name));
+        }
+    }
+    info["isa_variants"] = names;
+    info["vector_extensions"] = table.vector_ext;
+    info["avx2"] = table.avx2;
+    info["fma"] = table.fma;
+    info["avx512f"] = table.avx512;
+    info["vec_bytes"] = table.vec_bytes;
     info["x86_denormal_guard"] =
 #ifdef MONTLOK_X86
         true;
 #else
         false;
 #endif
-    info["openmp_dispatch"] =
-#ifdef _OPENMP
-        true;
-#else
-        false;
-#endif
+    info["openmp_dispatch"] = openmp_forks();
+    info["parallel_dispatch"] = openmp_forks() ? "openmp" : "tensor_iterator";
+    info["threads"] = at::get_num_threads();
     info["block_width_headdim_64"] = montlok::siso_block_width(64);
     info["compiler"] =
 #if defined(__clang__)
@@ -1342,6 +1450,7 @@ py::dict build_info() {
 #else
         std::string("unknown");
 #endif
+    info["cpu"] = describe_cpu();
     return info;
 }
 
@@ -1380,5 +1489,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("mla_forward", &mla_forward, "Complete oneDNN/flash-attention MLA inference path");
     module.def("stage2_tail_forward", &stage2_tail_forward,
                "Complete recurrent one-layer mHC stage-2 tail inference in one native call");
-    module.def("build_info", &build_info, "SIMD/compiler details of this build");
+    module.def("build_info", &build_info, "Compiler, kernel variant and dispatch details of this build");
+    module.def("cpu_features", &describe_cpu, "Instruction-set features of the host CPU");
+    module.def("isa_variants", &isa_variants,
+               "Kernel variants compiled into this build and whether this CPU supports them");
+    module.def("active_isa", &active_isa, "Name of the kernel variant in use");
+    module.def("set_isa", &set_isa, "Switch the kernel variant (force=True skips the CPU support check)",
+               py::arg("name"), py::arg("force") = false);
 }

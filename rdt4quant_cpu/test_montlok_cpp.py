@@ -342,6 +342,61 @@ def test_cpu_linear() -> None:
         report(name + " oneDNN disabled", disabled, expected, 0.0)
 
 
+def test_isa_variants() -> None:
+    """Every kernel variant this CPU supports must agree with the others.
+
+    Variants with the same FMA availability share every rounding and must
+    match bit for bit; across an FMA boundary (x86-64 baseline vs AVX2) the
+    fp32 recurrence may differ by a few ulp.
+    """
+    from montlok_loader import load_montlok
+
+    ext = load_montlok()
+    all_variants = ext.isa_variants()
+    variants = [variant for variant in all_variants if variant["supported"]]
+    print(
+        f"variants {[v['name'] for v in all_variants]} supported {[v['name'] for v in variants]} "
+        f"active {ext.active_isa()} dispatch {ext.build_info()['parallel_dispatch']}"
+    )
+    if len(variants) < 2:
+        print("one supported variant: nothing to compare")
+        return
+    torch.manual_seed(21)
+    layer = Mamba3CPUReference(256, d_state=64, expand=2, headdim=64).eval()
+    hc = ManifoldHyperConnectionCPU(256, n_streams=4, sinkhorn_iters=20).eval()
+    with torch.no_grad():
+        layer.D.add_(torch.randn_like(layer.D) * 0.5)
+        for alpha in (hc.pre_alpha, hc.post_alpha, hc.res_alpha):
+            alpha.fill_(0.7)
+        hc.res_bias.add_(torch.randn(4, 4))
+    holder = nn.Sequential(RMSNorm(256, eps=1e-6).eval())
+    install_cpu_layers(holder)
+    x = torch.randn(1, 480, 256)
+    streams = torch.randn(1, 480, 4, 256)
+    mix = torch.randn(256, 256) / 16.0
+
+    def outputs():
+        with torch.inference_mode(), backend(MONTLOK_CPP="1"):
+            return (layer(x), hc(streams, lambda agg: torch.tanh(agg @ mix)), holder(x))
+
+    results = {}
+    original = ext.active_isa()
+    try:
+        for variant in variants:
+            ext.set_isa(variant["name"])
+            results[variant["name"]] = outputs()
+    finally:
+        ext.set_isa(original)
+    for index, first in enumerate(variants):
+        for second in variants[index + 1 :]:
+            same_fma = first["fma"] == second["fma"]
+            for label, expected, actual in zip(
+                ("mamba layer", "mHC", "RMSNorm"), results[first["name"]], results[second["name"]], strict=True
+            ):
+                tol = 0.0 if same_fma else 2e-5 * (1.0 + float(expected.abs().max()))
+                report(f"isa {second['name']} vs {first['name']}: {label}", actual, expected, tol)
+
+
 def load_config() -> dict:
     return json.loads((HERE.parent / "rdt4quant" / "config.json").read_text())
 
@@ -550,6 +605,7 @@ def main() -> int:
         test_mhc_chain,
         test_cpu_layers,
         test_cpu_linear,
+        test_isa_variants,
         test_mla,
         test_full_model,
     ):

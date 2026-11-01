@@ -2,7 +2,8 @@
 // Apache-2.0 weight-compatible CPU kernels for Manifold-Constrained
 // Hyper-Connections (mHC, arXiv:2512.24880) as used by the RDT stage-2 layer.
 //
-// Torch-free like montlok_kernel.h. One mHC residual costs, in the PyTorch
+// Torch-free like montlok_kernel.h (and, like it, compiled once per
+// instruction set through montlok_isa.h). One mHC residual costs, in the PyTorch
 // reference, ~100 tiny ops per layer call (20 Sinkhorn iterations x 2
 // logsumexp x 2 subtractions on a [B*L, n, n] tensor, two batched matmuls over
 // B*L 4x4 matrices, ...). Each op is a few microseconds of work plus a thread
@@ -21,47 +22,7 @@
 #include "montlok_kernel.h"
 
 namespace montlok {
-
-// Everything one ManifoldHyperConnection.forward needs before the wrapped
-// layer runs. Tokens are B*L flattened; `streams` is [tokens, n, d] with the
-// stream rows `stream_stride` floats apart (d for a contiguous tensor, 0 when
-// every stream is the same [tokens, d] row, i.e. the expanded backbone).
-struct MhcPlan {
-    const float* streams;
-    int64_t stream_stride;
-    int64_t token_stride;   // floats between tokens of `streams`
-    const float* norm_w;    // [d] RMSNorm weight of dyn_norm
-    const double* proj_w;   // [(2n + n*n), d] pre_proj, post_proj, res_proj rows widened
-    const float* pre_bias;  // [n]
-    const float* post_bias; // [n]
-    const float* res_bias;  // [n, n]
-    double pre_alpha;
-    double post_alpha;
-    double res_alpha;
-    double eps;
-    int64_t tokens;
-    int64_t n;
-    int64_t d;
-    int sinkhorn_iters;
-    float* agg;   // [tokens, d]   sum_i pre_i * streams_i
-    const float* agg_norm_w;  // optional [d], normalizes agg in place for the wrapped layer
-    double agg_norm_eps;
-    float* pre;   // [tokens, n]   sigmoid(pre logits)
-    float* post;  // [tokens, n]   2 * sigmoid(post logits)
-    float* res;   // [tokens, n, n] doubly stochastic mixing matrix
-};
-
-inline int64_t mhc_proj_rows(int64_t n) noexcept {
-    return 2 * n + n * n;
-}
-
-// Tokens whose Sinkhorn projections are iterated together, one per SIMD lane.
-constexpr int kMhcTokenBlock = 4;
-
-// Doubles of per-thread scratch needed by mhc_prepare_block.
-inline int64_t mhc_scratch_doubles(const MhcPlan& p) noexcept {
-    return (p.d + mhc_proj_rows(p.n) + p.n * p.n + p.n) * kMhcTokenBlock;
-}
+MONTLOK_ISA_NAMESPACE_BEGIN
 
 inline double sigmoid_d(double x) noexcept {
     return 1.0 / (1.0 + std::exp(-x));
@@ -460,26 +421,23 @@ inline void mhc_combine_token(const float* __restrict streams, int64_t sd, const
     }
 }
 
-// Second half of a hyper-connection over all tokens: inputs of the residual
-// that just ran, plus the new streams it writes.
-struct MhcCombinePlan {
-    const float* streams;   // [tokens, n, d] rows stream_stride apart, tokens token_stride apart
-    int64_t stream_stride;
-    int64_t token_stride;
-    const float* res;       // [tokens, n, n]
-    const float* post;      // [tokens, n]
-    const float* out;       // [tokens, d]
-    float* new_streams;     // [tokens, n, d] contiguous
-    float* collapsed;       // [tokens, d] or null
-    int64_t n;
-    int64_t d;
-};
-
 inline void mhc_combine_range(const MhcCombinePlan& c, int64_t begin, int64_t end) noexcept {
     for (int64_t token = begin; token < end; ++token) {
         mhc_combine_token(c.streams + token * c.token_stride, c.stream_stride, c.res + token * c.n * c.n,
                           c.post + token * c.n, c.out + token * c.d, c.new_streams + token * c.n * c.d,
                           c.collapsed != nullptr ? c.collapsed + token * c.d : nullptr, c.n, c.d);
+    }
+}
+
+// mhc_combine for tokens [begin, end) that keeps only the collapsed mean
+// (`c.collapsed`, TwoStageCore._collapse); the mixed streams of one token go
+// to `scratch` (n * d floats) and are never materialised.
+inline void mhc_combine_collapse_range(const MhcCombinePlan& c, int64_t begin, int64_t end,
+                                       float* __restrict scratch) noexcept {
+    for (int64_t token = begin; token < end; ++token) {
+        mhc_combine_token(c.streams + token * c.token_stride, c.stream_stride, c.res + token * c.n * c.n,
+                          c.post + token * c.n, c.out + token * c.d, scratch, c.collapsed + token * c.d, c.n,
+                          c.d);
     }
 }
 
@@ -567,4 +525,5 @@ inline void mhc_combine_prepare_range(const MhcCombinePlan& c, const MhcPlan& p,
     }
 }
 
+MONTLOK_ISA_NAMESPACE_END
 }  // namespace montlok

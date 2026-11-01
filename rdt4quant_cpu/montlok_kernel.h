@@ -2,184 +2,92 @@
 // Apache-2.0 weight-compatible CPU kernels for Mamba-3 SISO.
 //
 // This header is torch-free so the same code can be compiled into the PyTorch
-// extension (montlok.cpp) and into the standalone self-test
-// (montlok_selftest.cpp). The recurrence follows the public state-spaces/mamba
-// reference equations; the pre-processing mirrors Mamba3CPUReference.forward in
-// mamba3_cpu.py operation by operation so the fused path stays weight- and
+// extension (montlok.cpp, through the instruction-set variants of
+// montlok_isa.h) and into the standalone self-test (montlok_selftest.cpp).
+// The recurrence follows the public state-spaces/mamba reference equations;
+// the pre-processing mirrors Mamba3CPUReference.forward in mamba3_cpu.py
+// operation by operation so the fused path stays weight- and
 // numerics-compatible with the pure PyTorch reference.
 //
-// Performance design (AVX2 + FMA on x86-64, NEON on arm64):
+// Performance design (SSE2 / AVX2+FMA / AVX-512 on x86-64, NEON on arm64):
 //   * The SSM state for one (batch, head) is [d_state, headdim]. Rows of the
 //     state along headdim are independent, so a work item is (batch, head,
 //     16-lane headdim block): B*H*headdim/16 items instead of B*H (32 items
 //     for the [1, 480, 8, 64] model shape).
 //   * Inside a work item the state is stored [d_state][block] and processed
-//     with 256-bit GCC/Clang vector extensions (one AVX2 ymm register per 8
-//     floats, two NEON registers on arm64). Every 8 state elements cost one
-//     multiply and three FMAs, which is the arithmetic minimum for the
-//     trapezoidal update; k/q enter as broadcast scalars so there is no
+//     with GCC/Clang vector extensions: two 8-float vectors per block (one
+//     AVX2 ymm register each, two NEON or SSE registers on narrower cores) or,
+//     in the AVX-512 variant, one 16-float zmm register. Every state element
+//     costs one multiply and three FMAs, which is the arithmetic minimum for
+//     the trapezoidal update; k/q enter as broadcast scalars so there is no
 //     horizontal reduction.
-//   * Two independent accumulators hide the 5-cycle FMA latency of the
-//     q . state reduction across the d_state loop.
+//   * Two independent accumulators hide the FMA latency of the q . state
+//     reduction across the d_state loop.
 //   * The state block (d_state * 16 * 4 = 4 KiB for d_state = 64) lives in L1.
 //   * FTZ/DAZ is enabled on x86 for the duration of a work item; decaying
 //     states otherwise reach the microcode-assisted denormal path.
+//   * Every floating-point expression is associated the same way in all
+//     variants and at every vector width, so variants with the same FMA
+//     availability return bit-identical results.
 
 #pragma once
 
-#include <algorithm>
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-#include <xmmintrin.h>
-#define MONTLOK_X86 1
-#endif
-
-#if defined(__GNUC__) || defined(__clang__)
-#define MONTLOK_VECTOR_EXT 1
-#endif
+#include "montlok_types.h"
 
 namespace montlok {
-
-// float(math.pi) and float(2 * math.pi) exactly as PyTorch casts the Python
-// scalars when they meet a float32 tensor.
-constexpr float kPiF = 3.14159265358979323846f;
-constexpr float kTwoPiF = 6.28318530717958647692f;
-
-// torch.nn.functional.softplus(x) with beta=1, threshold=20.
-inline float softplus_f(float x) noexcept {
-    return x > 20.0f ? x : std::log1p(std::exp(x));
-}
-
-inline float sigmoid_f(float x) noexcept {
-    return 1.0f / (1.0f + std::exp(-x));
-}
-
-// mamba3_cpu.heavy_tail_activation: clamp_min(x, 0) + 1 / (1 - clamp_max(x, 0)).
-inline float heavy_tail_f(float x) noexcept {
-    const float negative = std::min(x, 0.0f);
-    const float positive = std::max(x, 0.0f);
-    return positive + 1.0f / (1.0f - negative);
-}
-
-// Element strides of the leading [B, L, H] dimensions of a tensor whose last
-// dimension is contiguous.
-struct Strides3 {
-    int64_t b;
-    int64_t t;
-    int64_t h;
-};
-
-// Per (batch, time, head) coefficients of the trapezoidal recurrence
-//   state_t = alpha_t * state_{t-1} + beta_t * k_{t-1} (x) v_{t-1} + gamma_t * k_t (x) v_t
-struct StepCoefficients {
-    float alpha;
-    float beta;
-    float gamma;
-};
-
-inline StepCoefficients step_coefficients(float adt, float dt, float trap_logit) noexcept {
-    const float alpha = std::exp(adt);
-    const float trap = sigmoid_f(trap_logit);
-    return {alpha, (1.0f - trap) * dt * alpha, trap * dt};
-}
-
-// Enables flush-to-zero / denormals-are-zero on x86 for the lifetime of the
-// object. Denormal operands take a microcode assist (~100 cycles) on most x86
-// cores; the flushed values are below 1.2e-38 and do not affect the result.
-struct DenormalGuard {
-#ifdef MONTLOK_X86
-    unsigned int saved;
-    DenormalGuard() noexcept : saved(_mm_getcsr()) { _mm_setcsr(saved | 0x8040u); }
-    ~DenormalGuard() { _mm_setcsr(saved); }
-#else
-    DenormalGuard() noexcept {}
-#endif
-    DenormalGuard(const DenormalGuard&) = delete;
-    DenormalGuard& operator=(const DenormalGuard&) = delete;
-};
+MONTLOK_ISA_NAMESPACE_BEGIN
 
 // ---------------------------------------------------------------------------
-// Recurrence
+// Vector helpers
 // ---------------------------------------------------------------------------
-
-struct SisoPlan {
-    int64_t B;
-    int64_t L;
-    int64_t H;
-    int64_t N;  // d_state
-    int64_t D;  // headdim
-    const float* q;     // [B, L, H, N]
-    Strides3 qs;
-    const float* k;     // [B, L, H, N]
-    Strides3 ks;
-    const float* v;     // [B, L, H, D]
-    Strides3 vs;
-    const float* gate;  // [B, L, H, D]: z * sigmoid(z), or the raw z lanes when gate_logits
-    Strides3 gs;
-    bool gate_logits;   // apply silu to `gate` inside the kernel (double, one rounding)
-    const float* alpha; // [B, L, H] contiguous
-    const float* beta;  // [B, L, H] contiguous
-    const float* gamma; // [B, L, H] contiguous
-    const float* skip;  // [H]
-    float* out;         // [B, L, H, D]
-    Strides3 os;
-};
-
-// Width of one headdim block handled by a work item; 0 selects the scalar path
-// that processes a whole head.
-inline int siso_block_width(int64_t headdim) noexcept {
-#ifdef MONTLOK_VECTOR_EXT
-    if (headdim % 16 == 0) {
-        return 16;
-    }
-    if (headdim % 8 == 0) {
-        return 8;
-    }
-#endif
-    (void)headdim;
-    return 0;
-}
-
-inline int64_t siso_blocks_per_head(int64_t headdim) noexcept {
-    const int width = siso_block_width(headdim);
-    return width ? headdim / width : 1;
-}
-
-inline int64_t siso_work_items(const SisoPlan& plan) noexcept {
-    return plan.B * plan.H * siso_blocks_per_head(plan.D);
-}
-
-// Scratch floats a work item needs (state block plus, for the scalar path, an
-// accumulator row).
-inline int64_t siso_scratch_floats(const SisoPlan& plan) noexcept {
-    const int width = siso_block_width(plan.D);
-    return width ? plan.N * width : plan.N * plan.D + plan.D;
-}
 
 #ifdef MONTLOK_VECTOR_EXT
 
+typedef float v4f __attribute__((vector_size(16)));
 typedef float v8f __attribute__((vector_size(32)));
+typedef double v4d __attribute__((vector_size(32)));
+typedef int64_t v4i __attribute__((vector_size(32)));
+#if MONTLOK_VEC_BYTES >= 64
+typedef float v16f __attribute__((vector_size(64)));
+#endif
 
-inline v8f load8(const float* p) noexcept {
-    v8f r;
+template <typename V>
+constexpr int vec_lanes() noexcept {
+    return static_cast<int>(sizeof(V) / sizeof(float));
+}
+
+template <typename V>
+inline V vload(const float* p) noexcept {
+    V r;
     std::memcpy(&r, p, sizeof(r));
     return r;
 }
 
-inline void store8(float* p, const v8f& v) noexcept {
+template <typename V>
+inline void vstore(float* p, const V& v) noexcept {
     std::memcpy(p, &v, sizeof(v));
 }
 
-inline v8f splat8(float x) noexcept {
-    return v8f{x, x, x, x, x, x, x, x};
+template <typename V>
+inline V vsplat(float x) noexcept {
+    V r;
+    for (int lane = 0; lane < vec_lanes<V>(); ++lane) {
+        r[lane] = x;
+    }
+    return r;
 }
 
-typedef float v4f __attribute__((vector_size(16)));
-typedef double v4d __attribute__((vector_size(32)));
+inline v8f load8(const float* p) noexcept {
+    return vload<v8f>(p);
+}
+
+inline void store8(float* p, const v8f& v) noexcept {
+    vstore<v8f>(p, v);
+}
+
+inline v8f splat8(float x) noexcept {
+    return vsplat<v8f>(x);
+}
 
 inline v4d load4d(const double* p) noexcept {
     v4d r;
@@ -206,8 +114,6 @@ inline void store4d_as_f(float* p, const v4d& v) noexcept {
 inline v4d splat4d(double x) noexcept {
     return v4d{x, x, x, x};
 }
-
-typedef int64_t v4i __attribute__((vector_size(32)));
 
 inline v4i splat4i(int64_t x) noexcept {
     return v4i{x, x, x, x};
@@ -265,21 +171,27 @@ inline v4d silu4_d(const v4d& z) noexcept {
     return z / (splat4d(1.0) + exp4_d(-z));
 }
 
+// y * silu(z) for the lanes of one float vector, evaluated in double four
+// lanes at a time and rounded once.
+template <typename V>
+inline V gate_silu(const V& y, const V& z) noexcept {
+    constexpr int pieces = static_cast<int>(sizeof(V) / sizeof(v4f));
+    V out;
+    for (int i = 0; i < pieces; ++i) {
+        v4f y_part;
+        v4f z_part;
+        std::memcpy(&y_part, reinterpret_cast<const char*>(&y) + i * sizeof(v4f), sizeof(v4f));
+        std::memcpy(&z_part, reinterpret_cast<const char*>(&z) + i * sizeof(v4f), sizeof(v4f));
+        const v4d gated = __builtin_convertvector(y_part, v4d) * silu4_d(__builtin_convertvector(z_part, v4d));
+        const v4f gated_f = __builtin_convertvector(gated, v4f);
+        std::memcpy(reinterpret_cast<char*>(&out) + i * sizeof(v4f), &gated_f, sizeof(v4f));
+    }
+    return out;
+}
+
 // y * silu(z) for eight floats, evaluated in double and rounded once.
 inline v8f gate_silu8(const v8f& y, const v8f& z) noexcept {
-    v4f y_lo, y_hi, z_lo, z_hi;
-    std::memcpy(&y_lo, &y, sizeof(y_lo));
-    std::memcpy(&y_hi, reinterpret_cast<const char*>(&y) + sizeof(y_lo), sizeof(y_hi));
-    std::memcpy(&z_lo, &z, sizeof(z_lo));
-    std::memcpy(&z_hi, reinterpret_cast<const char*>(&z) + sizeof(z_lo), sizeof(z_hi));
-    const v4d lo = __builtin_convertvector(y_lo, v4d) * silu4_d(__builtin_convertvector(z_lo, v4d));
-    const v4d hi = __builtin_convertvector(y_hi, v4d) * silu4_d(__builtin_convertvector(z_hi, v4d));
-    const v4f lo_f = __builtin_convertvector(lo, v4f);
-    const v4f hi_f = __builtin_convertvector(hi, v4f);
-    v8f out;
-    std::memcpy(&out, &lo_f, sizeof(lo_f));
-    std::memcpy(reinterpret_cast<char*>(&out) + sizeof(lo_f), &hi_f, sizeof(hi_f));
-    return out;
+    return gate_silu<v8f>(y, z);
 }
 
 // sin and cos of four angles in double precision. The angles are the fp32
@@ -330,18 +242,25 @@ inline SinCos4 sincos4_d(const v4d& x) noexcept {
     return result;
 }
 
-// One (batch, head, headdim block) work item. NV is the number of 8-lane
-// vectors per block (2 -> 16 lanes). `state` holds N * 8 * NV floats laid out
-// [n][lane].
-template <int NV>
+// ---------------------------------------------------------------------------
+// Recurrence
+// ---------------------------------------------------------------------------
+
+// One (batch, head, headdim block) work item. V is the float vector type and
+// NV the number of vectors per block: <v8f, 2> or <v16f, 1> for 16 lanes,
+// <v8f, 1> for 8. `state` holds N * NV * lanes floats laid out [n][lane].
+template <typename V, int NV>
 inline void siso_block_vec(const SisoPlan& p, int64_t b, int64_t h, int64_t d0, float* __restrict state) noexcept {
-    constexpr int DB = NV * 8;
+    constexpr int VL = vec_lanes<V>();
+    constexpr int DB = NV * VL;
     const int64_t N = p.N;
     const int64_t L = p.L;
-    std::fill(state, state + N * DB, 0.0f);
+    for (int64_t i = 0; i < N * DB; ++i) {
+        state[i] = 0.0f;
+    }
 
-    const v8f zero = splat8(0.0f);
-    const v8f skipv = splat8(p.skip[h]);
+    const V zero = vsplat<V>(0.0f);
+    const V skipv = vsplat<V>(p.skip[h]);
     const float* q_row = p.q + b * p.qs.b + h * p.qs.h;
     const float* k_row = p.k + b * p.ks.b + h * p.ks.h;
     const float* v_row = p.v + b * p.vs.b + h * p.vs.h + d0;
@@ -353,20 +272,20 @@ inline void siso_block_vec(const SisoPlan& p, int64_t b, int64_t h, int64_t d0, 
 
     for (int64_t t = 0; t < L; ++t) {
         const int64_t ci = t * p.H;
-        const v8f al = splat8(coef_alpha[ci]);
-        const v8f be = splat8(coef_beta[ci]);
-        const v8f ga = splat8(coef_gamma[ci]);
+        const V al = vsplat<V>(coef_alpha[ci]);
+        const V be = vsplat<V>(coef_beta[ci]);
+        const V ga = vsplat<V>(coef_gamma[ci]);
 
-        v8f pv[NV];
-        v8f cv[NV];
-        v8f acc0[NV];
-        v8f acc1[NV];
+        V pv[NV];
+        V cv[NV];
+        V acc0[NV];
+        V acc1[NV];
         const float* k_prev = k_row;
         if (t > 0) {
             k_prev = k_row - p.ks.t;
             const float* v_prev = v_row - p.vs.t;
             for (int i = 0; i < NV; ++i) {
-                pv[i] = be * load8(v_prev + 8 * i);
+                pv[i] = be * vload<V>(v_prev + VL * i);
             }
         } else {
             for (int i = 0; i < NV; ++i) {
@@ -374,7 +293,7 @@ inline void siso_block_vec(const SisoPlan& p, int64_t b, int64_t h, int64_t d0, 
             }
         }
         for (int i = 0; i < NV; ++i) {
-            cv[i] = ga * load8(v_row + 8 * i);
+            cv[i] = ga * vload<V>(v_row + VL * i);
             acc0[i] = zero;
             acc1[i] = zero;
         }
@@ -383,47 +302,47 @@ inline void siso_block_vec(const SisoPlan& p, int64_t b, int64_t h, int64_t d0, 
         for (; n + 2 <= N; n += 2) {
             float* s0 = state + n * DB;
             float* s1 = s0 + DB;
-            const v8f kp0 = splat8(k_prev[n]);
-            const v8f kc0 = splat8(k_row[n]);
-            const v8f qq0 = splat8(q_row[n]);
-            const v8f kp1 = splat8(k_prev[n + 1]);
-            const v8f kc1 = splat8(k_row[n + 1]);
-            const v8f qq1 = splat8(q_row[n + 1]);
+            const V kp0 = vsplat<V>(k_prev[n]);
+            const V kc0 = vsplat<V>(k_row[n]);
+            const V qq0 = vsplat<V>(q_row[n]);
+            const V kp1 = vsplat<V>(k_prev[n + 1]);
+            const V kc1 = vsplat<V>(k_row[n + 1]);
+            const V qq1 = vsplat<V>(q_row[n + 1]);
             for (int i = 0; i < NV; ++i) {
-                v8f s = load8(s0 + 8 * i);
+                V s = vload<V>(s0 + VL * i);
                 s = s * al + kp0 * pv[i] + kc0 * cv[i];
-                store8(s0 + 8 * i, s);
+                vstore<V>(s0 + VL * i, s);
                 acc0[i] += s * qq0;
             }
             for (int i = 0; i < NV; ++i) {
-                v8f s = load8(s1 + 8 * i);
+                V s = vload<V>(s1 + VL * i);
                 s = s * al + kp1 * pv[i] + kc1 * cv[i];
-                store8(s1 + 8 * i, s);
+                vstore<V>(s1 + VL * i, s);
                 acc1[i] += s * qq1;
             }
         }
         for (; n < N; ++n) {
             float* s0 = state + n * DB;
-            const v8f kp0 = splat8(k_prev[n]);
-            const v8f kc0 = splat8(k_row[n]);
-            const v8f qq0 = splat8(q_row[n]);
+            const V kp0 = vsplat<V>(k_prev[n]);
+            const V kc0 = vsplat<V>(k_row[n]);
+            const V qq0 = vsplat<V>(q_row[n]);
             for (int i = 0; i < NV; ++i) {
-                v8f s = load8(s0 + 8 * i);
+                V s = vload<V>(s0 + VL * i);
                 s = s * al + kp0 * pv[i] + kc0 * cv[i];
-                store8(s0 + 8 * i, s);
+                vstore<V>(s0 + VL * i, s);
                 acc0[i] += s * qq0;
             }
         }
 
         if (p.gate_logits) {
             for (int i = 0; i < NV; ++i) {
-                const v8f y = (acc0[i] + acc1[i]) + skipv * load8(v_row + 8 * i);
-                store8(o_row + 8 * i, gate_silu8(y, load8(g_row + 8 * i)));
+                const V y = (acc0[i] + acc1[i]) + skipv * vload<V>(v_row + VL * i);
+                vstore<V>(o_row + VL * i, gate_silu<V>(y, vload<V>(g_row + VL * i)));
             }
         } else {
             for (int i = 0; i < NV; ++i) {
-                const v8f y = (acc0[i] + acc1[i]) + skipv * load8(v_row + 8 * i);
-                store8(o_row + 8 * i, y * load8(g_row + 8 * i));
+                const V y = (acc0[i] + acc1[i]) + skipv * vload<V>(v_row + VL * i);
+                vstore<V>(o_row + VL * i, y * vload<V>(g_row + VL * i));
             }
         }
 
@@ -445,7 +364,9 @@ inline void siso_head_scalar(const SisoPlan& p, int64_t b, int64_t h, float* __r
     const int64_t D = p.D;
     const int64_t L = p.L;
     float* __restrict acc = state + N * D;
-    std::fill(state, state + N * D, 0.0f);
+    for (int64_t i = 0; i < N * D; ++i) {
+        state[i] = 0.0f;
+    }
 
     const float skip = p.skip[h];
     const float* q_row = p.q + b * p.qs.b + h * p.qs.h;
@@ -520,10 +441,14 @@ inline void siso_run_work_item(const SisoPlan& plan, int64_t item, float* scratc
     switch (siso_block_width(plan.D)) {
 #ifdef MONTLOK_VECTOR_EXT
         case 16:
-            siso_block_vec<2>(plan, b, h, block * 16, scratch);
+#if MONTLOK_VEC_BYTES >= 64
+            siso_block_vec<v16f, 1>(plan, b, h, block * 16, scratch);
+#else
+            siso_block_vec<v8f, 2>(plan, b, h, block * 16, scratch);
+#endif
             break;
         case 8:
-            siso_block_vec<1>(plan, b, h, block * 8, scratch);
+            siso_block_vec<v8f, 1>(plan, b, h, block * 8, scratch);
             break;
 #endif
         default:
@@ -533,55 +458,8 @@ inline void siso_run_work_item(const SisoPlan& plan, int64_t item, float* scratc
 }
 
 // ---------------------------------------------------------------------------
-// Fused pre-processing of the in_proj output
+// Fused pre-processing of the in_proj output (phases A, B, C; see PrepPlan)
 // ---------------------------------------------------------------------------
-//
-// The in_proj row layout is [z | x | B | C | dt | A | trap | angles] with widths
-// [d_inner, d_inner, G*N, G*N, H, H, H, R]. Three phases replace ~60 small
-// PyTorch ops:
-//   A  per token : BCNorm + bias -> unrotated q/k, dt/A/trap -> alpha/beta/gamma,
-//                  tanh(angles) * pi * dt -> angle_term
-//   B  per (b, h, r) chain : cumulative sum over time (double accumulation,
-//                  exactly like ATen's CPU cumsum) -> cum
-//   C  per token : wrap to [0, 2pi), sincos, rotate the first 2R lanes of q/k
-
-struct PrepPlan {
-    int64_t B;
-    int64_t L;
-    int64_t W;           // in_proj width
-    const float* proj;   // [B, L, W], last dim contiguous
-    int64_t proj_sb;
-    int64_t proj_st;
-    int64_t d_inner;
-    int64_t N;           // d_state
-    int64_t G;           // B/C groups
-    int64_t H;           // heads
-    int64_t D;           // headdim
-    int64_t R;           // rope angles (pairs rotated)
-    const float* b_bias;    // [H, N]
-    const float* c_bias;    // [H, N]
-    const float* b_norm_w;  // [N]
-    const float* c_norm_w;  // [N]
-    float b_eps;
-    float c_eps;
-    const float* dt_bias;   // [H]
-    float a_floor;
-    float* q;            // [B, L, H, N] contiguous (output)
-    float* k;            // [B, L, H, N] contiguous (output)
-    float* alpha;        // [B, L, H] (output)
-    float* beta;         // [B, L, H] (output)
-    float* gamma;        // [B, L, H] (output)
-    float* angle_term;   // [B, L, H, R] workspace
-    float* cum;          // [B, H, R, L] workspace
-};
-
-inline int64_t prep_expected_width(const PrepPlan& p) noexcept {
-    return 2 * p.d_inner + 2 * p.G * p.N + 3 * p.H + p.R;
-}
-
-inline int64_t prep_scratch_floats(const PrepPlan& p) noexcept {
-    return 2 * p.G * p.N + p.R;
-}
 
 // BCNorm: x * rsqrt(mean(x^2) + eps) * weight, all in fp32.
 inline void rms_norm_row(const float* __restrict x, const float* __restrict w, float eps, int64_t n,
@@ -719,4 +597,5 @@ inline void prep_rotate(const PrepPlan& p, int64_t b, int64_t t) noexcept {
     }
 }
 
+MONTLOK_ISA_NAMESPACE_END
 }  // namespace montlok

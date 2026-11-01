@@ -256,6 +256,7 @@ def main() -> None:
     parser.add_argument("--skip-reference", action="store_true", help="only time the C++ paths")
     parser.add_argument("--no-flush-denormal", action="store_true")
     parser.add_argument("--only", choices=("mamba", "stage2", "model"), action="append")
+    parser.add_argument("--isa", help="kernel variant to time (see build_info()['isa_variants']); 'force:NAME' skips the CPU check")
     parser.add_argument("--output", type=Path, help="write all timings as JSON")
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
@@ -265,7 +266,11 @@ def main() -> None:
 
     from montlok_loader import load_montlok
 
-    info = load_montlok().build_info()
+    ext = load_montlok()
+    if args.isa:
+        name = args.isa.removeprefix("force:")
+        ext.set_isa(name, force=args.isa != name)
+    info = ext.build_info()
     print(f"threads {torch.get_num_threads()}  torch {torch.__version__}  build {info}")
     bench = Bench(args.iterations, args.warmup)
     sections = set(args.only or ("mamba", "stage2", "model"))

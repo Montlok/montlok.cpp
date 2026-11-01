@@ -4,24 +4,34 @@
 // Checks every kernel in montlok_kernel.h / montlok_mhc.h / montlok_layers.h
 // against a naive double-precision implementation of the same mathematics on
 // several shapes (model geometry, odd sizes that hit the scalar and
-// partial-block paths, strided inputs) and then times the model shapes
-// single-threaded. Exits non-zero on the first tolerance violation.
+// partial-block paths, strided inputs) and times the model shapes
+// single-threaded. The suite runs once with the kernels compiled into this
+// file (the compiler's default target) and once per instruction-set variant
+// linked from montlok_isa_*.cpp that the CPU supports; variants with the
+// same FMA availability must agree bit for bit (reported per output).
+// Exits non-zero on any tolerance violation.
 //
-// Build (native):
-//   clang++ -O3 -std=c++17 -march=native -fno-math-errno -ffp-contract=fast \
-//       montlok_selftest.cpp -o montlok_selftest && ./montlok_selftest
-// Cross-build for x86-64 AVX2/FMA from arm64 macOS (runs under Rosetta 2):
-//   clang++ -O3 -std=c++17 -arch x86_64 -mavx2 -mfma -fno-math-errno -ffp-contract=fast \
-//       montlok_selftest.cpp -o montlok_selftest_x86 && arch -x86_64 ./montlok_selftest_x86
+// Build and run (run_selftest.sh does this, plus a 64-byte-vector build and,
+// on arm64 macOS, an x86-64 build run under Rosetta 2):
+//   clang++ -O3 -std=c++17 -fno-math-errno -ffp-contract=fast montlok_selftest.cpp \
+//       montlok_isa.cpp montlok_isa_baseline.cpp montlok_isa_avx2.cpp montlok_isa_avx512.cpp \
+//       -o montlok_selftest && ./montlok_selftest
+// MONTLOK_SELFTEST_FORCE=1 also runs the variants cpuid does not advertise;
+// MONTLOK_SELFTEST_FORCE=avx2 (a comma-separated list) forces only those
+// (Rosetta 2 executes AVX2 code while hiding it from cpuid, but not AVX-512).
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <map>
 #include <random>
 #include <string>
 #include <vector>
 
+#include "montlok_isa.h"
 #include "montlok_kernel.h"
 #include "montlok_layers.h"
 #include "montlok_mhc.h"
@@ -29,6 +39,71 @@
 namespace {
 
 int g_failures = 0;
+
+// The kernel table the suite runs through: the kernels compiled into this
+// translation unit (self_table) or one of the linked variants.
+const montlok::KernelTable* K = nullptr;
+
+const montlok::KernelTable& self_table() {
+    static const montlok::KernelTable table = {
+        "self",
+        -1,
+        MONTLOK_VEC_BYTES,
+#ifdef MONTLOK_VECTOR_EXT
+        true,
+#else
+        false,
+#endif
+#if defined(__FMA__) || defined(__aarch64__) || defined(__ARM_FEATURE_FMA)
+        true,
+#else
+        false,
+#endif
+#if defined(__AVX2__)
+        true,
+#else
+        false,
+#endif
+#if defined(__AVX512F__)
+        true,
+#else
+        false,
+#endif
+        &montlok::siso_run_work_item,
+        &montlok::prep_token,
+        &montlok::prep_chain,
+        &montlok::prep_rotate,
+        &montlok::mhc_prepare_range,
+        &montlok::mhc_combine_range,
+        &montlok::mhc_combine_collapse_range,
+        &montlok::mhc_combine_prepare_range,
+        &montlok::mhc_combine_prepare_inplace_range,
+        &montlok::rms_norm_rows,
+        &montlok::add_rms_norm_rows,
+        &montlok::swiglu_rows,
+        &montlok::layer_norm_rows,
+        &montlok::mla_rope_range,
+    };
+    return table;
+}
+
+// FNV-1a over the bytes of every main output, keyed by check name, so the
+// variants can be compared bit for bit after the suite ran with each.
+std::map<std::string, uint64_t>* g_digests = nullptr;
+
+template <class T>
+void digest(const std::string& name, const std::vector<T>& values) {
+    if (g_digests == nullptr) {
+        return;
+    }
+    uint64_t hash = 1469598103934665603ull;
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(values.data());
+    for (size_t i = 0; i < values.size() * sizeof(T); ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    (*g_digests)[name] = hash;
+}
 
 double seconds_now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -105,7 +180,7 @@ void test_siso(const SisoCase& c, bool timing) {
     auto run_all = [&]() {
         const int64_t items = montlok::siso_work_items(p);
         for (int64_t item = 0; item < items; ++item) {
-            montlok::siso_run_work_item(p, item, scratch.data());
+            K->siso_run_work_item(p, item, scratch.data());
         }
     };
     run_all();
@@ -150,6 +225,7 @@ void test_siso(const SisoCase& c, bool timing) {
                   (long long)H, (long long)N, (long long)D, c.strided_v ? " strided" : "", montlok::siso_block_width(D));
     // fp32 recurrence over L steps vs double: allow ~1e-5 relative to the output scale.
     check(name, max_abs_diff(out, ref), 2e-6 * (1.0 + absmax));
+    digest(name, out);
 
     // In-kernel silu gate: feed z and compare with the pre-activated gate path
     // (the reference gate is silu(z) rounded to float32, so only the gate's
@@ -169,12 +245,13 @@ void test_siso(const SisoCase& c, bool timing) {
         pl.out = out_logits.data();
         const int64_t items = montlok::siso_work_items(pl);
         for (int64_t item = 0; item < items; ++item) {
-            montlok::siso_run_work_item(pl, item, scratch.data());
+            K->siso_run_work_item(pl, item, scratch.data());
         }
         double gate_absmax = 0.0;
         for (float v : out) gate_absmax = std::max(gate_absmax, std::abs(static_cast<double>(v)));
         check(std::string(name) + " in-kernel gate", max_abs_diff(out_logits, std::vector<double>(out.begin(), out.end())),
               2.4e-7 * (1.0 + gate_absmax));
+        digest(std::string(name) + " in-kernel gate", out_logits);
         (void)ref_logits;
     }
 
@@ -226,13 +303,13 @@ void test_prep(const PrepCase& c, bool timing) {
     std::vector<float> scratch(montlok::prep_scratch_floats(p));
     auto run_all = [&]() {
         for (int64_t tok = 0; tok < B * L; ++tok) {
-            montlok::prep_token(p, tok / L, tok % L, scratch.data());
+            K->prep_token(p, tok / L, tok % L, scratch.data());
         }
         for (int64_t chain = 0; chain < B * H * R; ++chain) {
-            montlok::prep_chain(p, chain);
+            K->prep_chain(p, chain);
         }
         for (int64_t tok = 0; tok < B * L; ++tok) {
-            montlok::prep_rotate(p, tok / L, tok % L);
+            K->prep_rotate(p, tok / L, tok % L);
         }
     };
     run_all();
@@ -306,27 +383,32 @@ void test_prep(const PrepCase& c, bool timing) {
     check(std::string(name) + " alpha", max_abs_diff(alpha, alpha_ref), 1e-6);
     check(std::string(name) + " beta", max_abs_diff(beta, beta_ref), 1e-6);
     check(std::string(name) + " gamma", max_abs_diff(gamma, gamma_ref), 1e-6);
+    digest(std::string(name) + " q", q);
+    digest(std::string(name) + " k", k);
+    digest(std::string(name) + " alpha", alpha);
+    digest(std::string(name) + " beta", beta);
+    digest(std::string(name) + " gamma", gamma);
 
     if (timing) {
         const int reps = 50;
         double t0 = seconds_now();
         for (int rep = 0; rep < reps; ++rep) {
             for (int64_t tok = 0; tok < B * L; ++tok) {
-                montlok::prep_token(p, tok / L, tok % L, scratch.data());
+                K->prep_token(p, tok / L, tok % L, scratch.data());
             }
         }
         const double a_us = (seconds_now() - t0) / reps * 1e6;
         t0 = seconds_now();
         for (int rep = 0; rep < reps; ++rep) {
             for (int64_t chain = 0; chain < B * H * R; ++chain) {
-                montlok::prep_chain(p, chain);
+                K->prep_chain(p, chain);
             }
         }
         const double b_us = (seconds_now() - t0) / reps * 1e6;
         t0 = seconds_now();
         for (int rep = 0; rep < reps; ++rep) {
             for (int64_t tok = 0; tok < B * L; ++tok) {
-                montlok::prep_rotate(p, tok / L, tok % L);
+                K->prep_rotate(p, tok / L, tok % L);
             }
         }
         const double c_us = (seconds_now() - t0) / reps * 1e6;
@@ -407,12 +489,12 @@ void test_mhc(const MhcCase& c, bool timing) {
     p.tokens = T; p.n = n; p.d = d; p.sinkhorn_iters = c.iters;
     p.agg = agg.data(); p.pre = pre.data(); p.post = post.data(); p.res = res.data();
     std::vector<double> scratch(montlok::mhc_scratch_doubles(p));
-    auto run_prepare = [&]() { montlok::mhc_prepare_range(p, 0, T, scratch.data()); };
+    auto run_prepare = [&]() { K->mhc_prepare_range(p, 0, T, scratch.data()); };
     montlok::MhcCombinePlan cp{};
     cp.streams = streams.data(); cp.stream_stride = d; cp.token_stride = n * d;
     cp.res = res.data(); cp.post = post.data(); cp.out = out.data(); cp.new_streams = new_streams.data();
     cp.n = n; cp.d = d;
-    auto run_combine = [&]() { montlok::mhc_combine_range(cp, 0, T); };
+    auto run_combine = [&]() { K->mhc_combine_range(cp, 0, T); };
     run_prepare();
     run_combine();
 
@@ -497,14 +579,20 @@ void test_mhc(const MhcCase& c, bool timing) {
     for (double x : new_ref) new_max = std::max(new_max, std::abs(x));
     check(std::string(name) + " agg", max_abs_diff(agg, agg_ref), 1.2e-7 * (1.0 + agg_max));
     check(std::string(name) + " combine", max_abs_diff(new_streams, new_ref), 1.2e-7 * (1.0 + new_max));
+    digest(std::string(name) + " pre", pre);
+    digest(std::string(name) + " post", post);
+    digest(std::string(name) + " res", res);
+    digest(std::string(name) + " agg", agg);
+    digest(std::string(name) + " combine", new_streams);
 
     // Collapse: mean over the rounded new streams, one rounding.
     {
         std::vector<float> scratch_streams(n * d), collapsed(T * d);
         std::vector<double> collapsed_ref(T * d);
+        montlok::MhcCombinePlan cpc = cp;
+        cpc.collapsed = collapsed.data();
+        K->mhc_combine_collapse_range(cpc, 0, T, scratch_streams.data());
         for (int64_t t = 0; t < T; ++t) {
-            montlok::mhc_combine_token(streams.data() + t * n * d, d, res.data() + t * n * n, post.data() + t * n,
-                                       out.data() + t * d, scratch_streams.data(), collapsed.data() + t * d, n, d);
             for (int64_t k = 0; k < d; ++k) {
                 double m = 0.0;
                 for (int64_t i = 0; i < n; ++i) m += static_cast<double>(new_streams[(t * n + i) * d + k]);
@@ -512,6 +600,7 @@ void test_mhc(const MhcCase& c, bool timing) {
             }
         }
         check(std::string(name) + " collapse", max_abs_diff(collapsed, collapsed_ref), 1.2e-7 * (1.0 + new_max));
+        digest(std::string(name) + " collapse", collapsed);
     }
 
     // Fused write + read of the next residual must equal the two separate passes.
@@ -520,14 +609,14 @@ void test_mhc(const MhcCase& c, bool timing) {
         montlok::MhcPlan p2 = p;
         p2.streams = new_streams.data();
         p2.agg = agg2.data(); p2.pre = pre2.data(); p2.post = post2.data(); p2.res = res2.data();
-        montlok::mhc_prepare_range(p2, 0, T, scratch.data());
+        K->mhc_prepare_range(p2, 0, T, scratch.data());
         std::vector<float> agg3(T * d), pre3(T * n), post3(T * n), res3(T * n * n);
         montlok::MhcPlan p3 = p;
         p3.streams = streams2.data();
         p3.agg = agg3.data(); p3.pre = pre3.data(); p3.post = post3.data(); p3.res = res3.data();
         montlok::MhcCombinePlan cp3 = cp;
         cp3.new_streams = streams2.data();
-        montlok::mhc_combine_prepare_range(cp3, p3, 0, T, scratch.data());
+        K->mhc_combine_prepare_range(cp3, p3, 0, T, scratch.data());
         check(std::string(name) + " fused streams", max_abs_diff(streams2, std::vector<double>(new_streams.begin(), new_streams.end())), 0.0);
         check(std::string(name) + " fused agg", max_abs_diff(agg3, std::vector<double>(agg2.begin(), agg2.end())), 0.0);
         check(std::string(name) + " fused pre", max_abs_diff(pre3, std::vector<double>(pre2.begin(), pre2.end())), 0.0);
@@ -542,7 +631,7 @@ void test_mhc(const MhcCase& c, bool timing) {
             montlok::MhcCombinePlan cp4 = cp;
             cp4.streams = inplace_streams.data();
             cp4.new_streams = inplace_streams.data();
-            montlok::mhc_combine_prepare_inplace_range(cp4, p4, 0, T, scratch.data());
+            K->mhc_combine_prepare_inplace_range(cp4, p4, 0, T, scratch.data());
             check(std::string(name) + " in-place streams",
                   max_abs_diff(inplace_streams, std::vector<double>(new_streams.begin(), new_streams.end())), 0.0);
             check(std::string(name) + " in-place agg", max_abs_diff(agg4, std::vector<double>(agg2.begin(), agg2.end())), 0.0);
@@ -558,7 +647,7 @@ void test_mhc(const MhcCase& c, bool timing) {
             montlok::MhcCombinePlan cp5 = cp;
             cp5.streams = reused_streams.data();
             cp5.post = post5.data(); cp5.res = res5.data(); cp5.new_streams = reused_streams.data();
-            montlok::mhc_combine_prepare_inplace_range(cp5, p5, 0, T, scratch.data());
+            K->mhc_combine_prepare_inplace_range(cp5, p5, 0, T, scratch.data());
             check(std::string(name) + " reused streams",
                   max_abs_diff(reused_streams, std::vector<double>(new_streams.begin(), new_streams.end())), 0.0);
             check(std::string(name) + " reused agg", max_abs_diff(agg5, std::vector<double>(agg2.begin(), agg2.end())), 0.0);
@@ -574,7 +663,7 @@ void test_mhc(const MhcCase& c, bool timing) {
         p6.agg = agg6.data(); p6.pre = pre6.data(); p6.post = post6.data(); p6.res = res6.data();
         montlok::MhcCombinePlan cp6 = cp;
         cp6.post = post6.data(); cp6.res = res6.data(); cp6.new_streams = allocated_streams.data();
-        montlok::mhc_combine_prepare_range(cp6, p6, 0, T, scratch.data());
+        K->mhc_combine_prepare_range(cp6, p6, 0, T, scratch.data());
         check(std::string(name) + " reused coefficient streams",
               max_abs_diff(allocated_streams, std::vector<double>(new_streams.begin(), new_streams.end())), 0.0);
         check(std::string(name) + " reused coefficient agg",
@@ -603,8 +692,8 @@ void test_mhc(const MhcCase& c, bool timing) {
         pa.agg = agg_a.data(); pa.pre = pre_a.data(); pa.post = post_a.data(); pa.res = res_a.data();
         pb.streams = backbone.data(); pb.stream_stride = 0; pb.token_stride = d;
         pb.agg = agg_b.data(); pb.pre = pre_b.data(); pb.post = post_b.data(); pb.res = res_b.data();
-        montlok::mhc_prepare_range(pa, 0, T, scratch.data());
-        montlok::mhc_prepare_range(pb, 0, T, scratch.data());
+        K->mhc_prepare_range(pa, 0, T, scratch.data());
+        K->mhc_prepare_range(pb, 0, T, scratch.data());
         check(std::string(name) + " broadcast agg", max_abs_diff(agg_b, std::vector<double>(agg_a.begin(), agg_a.end())), 0.0);
         check(std::string(name) + " broadcast res", max_abs_diff(res_b, std::vector<double>(res_a.begin(), res_a.end())), 0.0);
         std::vector<float> new_a(T * n * d), new_b(T * n * d);
@@ -612,8 +701,8 @@ void test_mhc(const MhcCase& c, bool timing) {
         ca.streams = expanded.data(); ca.res = res_a.data(); ca.post = post_a.data(); ca.new_streams = new_a.data();
         cb.streams = backbone.data(); cb.stream_stride = 0; cb.token_stride = d;
         cb.res = res_a.data(); cb.post = post_a.data(); cb.new_streams = new_b.data();
-        montlok::mhc_combine_range(ca, 0, T);
-        montlok::mhc_combine_range(cb, 0, T);
+        K->mhc_combine_range(ca, 0, T);
+        K->mhc_combine_range(cb, 0, T);
         check(std::string(name) + " broadcast combine", max_abs_diff(new_b, std::vector<double>(new_a.begin(), new_a.end())), 0.0);
     }
 
@@ -639,7 +728,7 @@ void test_rms_norm(int64_t rows, int64_t dim, int64_t groups, int64_t row_stride
     rng.fill(x, 2.0);
     for (auto& v : w) v = 1.0f + rng.gauss(0.3);
     const double eps = static_cast<double>(1e-6f);
-    montlok::rms_norm_rows(x.data(), row_stride, w.data(), eps, dim, groups, 0, rows, out.data());
+    K->rms_norm_rows(x.data(), row_stride, w.data(), eps, dim, groups, 0, rows, out.data());
     std::vector<double> ref(rows * dim);
     const int64_t gs = dim / groups;
     double absmax = 0.0;
@@ -662,11 +751,12 @@ void test_rms_norm(int64_t rows, int64_t dim, int64_t groups, int64_t row_stride
     std::snprintf(name, sizeof(name), "rms_norm rows%lld dim%lld groups%lld stride%lld", (long long)rows, (long long)dim,
                   (long long)groups, (long long)row_stride);
     check(name, max_abs_diff(out, ref), 1.2e-7 * (1.0 + absmax));
+    digest(name, out);
     if (timing) {
         const int reps = 500;
         const double t0 = seconds_now();
         for (int rep = 0; rep < reps; ++rep) {
-            montlok::rms_norm_rows(x.data(), row_stride, w.data(), eps, dim, groups, 0, rows, out.data());
+            K->rms_norm_rows(x.data(), row_stride, w.data(), eps, dim, groups, 0, rows, out.data());
         }
         std::printf("  timing: rms_norm %.1f us/pass single-threaded\n", (seconds_now() - t0) / reps * 1e6);
     }
@@ -712,7 +802,7 @@ void test_swiglu(int64_t rows, int64_t hidden, int64_t row_stride, bool timing) 
     Rng rng(37);
     std::vector<float> x(rows * row_stride), out(rows * hidden);
     rng.fill(x, 3.0);
-    montlok::swiglu_rows(x.data(), row_stride, hidden, 0, rows, out.data());
+    K->swiglu_rows(x.data(), row_stride, hidden, 0, rows, out.data());
     std::vector<double> ref(rows * hidden);
     double absmax = 0.0;
     for (int64_t r = 0; r < rows; ++r) {
@@ -727,11 +817,12 @@ void test_swiglu(int64_t rows, int64_t hidden, int64_t row_stride, bool timing) 
     std::snprintf(name, sizeof(name), "swiglu rows%lld hidden%lld stride%lld", (long long)rows, (long long)hidden,
                   (long long)row_stride);
     check(name, max_abs_diff(out, ref), 1.2e-7 * (1.0 + absmax));
+    digest(name, out);
     if (timing) {
         const int reps = 200;
         const double t0 = seconds_now();
         for (int rep = 0; rep < reps; ++rep) {
-            montlok::swiglu_rows(x.data(), row_stride, hidden, 0, rows, out.data());
+            K->swiglu_rows(x.data(), row_stride, hidden, 0, rows, out.data());
         }
         std::printf("  timing: swiglu %.1f us/pass single-threaded\n", (seconds_now() - t0) / reps * 1e6);
     }
@@ -747,7 +838,7 @@ void test_layer_norm(int64_t rows, int64_t dim, int64_t row_stride, bool with_bi
     for (auto& v : w) v = 1.0f + rng.gauss(0.3);
     for (auto& v : b) v = rng.gauss(0.5);
     const double eps = static_cast<double>(1e-5f);
-    montlok::layer_norm_rows(x.data(), row_stride, w.data(), with_bias ? b.data() : nullptr, eps, dim, 0, rows,
+    K->layer_norm_rows(x.data(), row_stride, w.data(), with_bias ? b.data() : nullptr, eps, dim, 0, rows,
                              out.data());
     std::vector<double> ref(rows * dim);
     double absmax = 0.0;
@@ -772,11 +863,12 @@ void test_layer_norm(int64_t rows, int64_t dim, int64_t row_stride, bool with_bi
     std::snprintf(name, sizeof(name), "layer_norm rows%lld dim%lld stride%lld bias%d", (long long)rows, (long long)dim,
                   (long long)row_stride, with_bias ? 1 : 0);
     check(name, max_abs_diff(out, ref), 1.2e-7 * (1.0 + absmax));
+    digest(name, out);
     if (timing) {
         const int reps = 500;
         const double t0 = seconds_now();
         for (int rep = 0; rep < reps; ++rep) {
-            montlok::layer_norm_rows(x.data(), row_stride, w.data(), with_bias ? b.data() : nullptr, eps, dim, 0, rows,
+            K->layer_norm_rows(x.data(), row_stride, w.data(), with_bias ? b.data() : nullptr, eps, dim, 0, rows,
                                      out.data());
         }
         std::printf("  timing: layer_norm %.1f us/pass single-threaded\n", (seconds_now() - t0) / reps * 1e6);
@@ -809,9 +901,7 @@ void test_mla_rope(int64_t tokens, int64_t length, int64_t heads, int64_t nope, 
     p.k_rope = k_rope.data(); p.k_rope_token_stride = rope;
     p.cosine = cosine.data(); p.sine = sine.data(); p.k = k.data();
     p.length = length; p.heads = heads; p.head_dim = head_dim; p.nope_dim = nope; p.rope_dim = rope;
-    for (int64_t t = 0; t < tokens; ++t) {
-        montlok::mla_rope_token(p, t, scratch.data());
-    }
+    K->mla_rope_range(p, 0, tokens, scratch.data());
     std::vector<double> q_ref(q.size()), k_ref(k.size());
     auto rope_ref = [&](const float* x, int64_t pos, double* out_v) {
         const int64_t half = rope / 2;
@@ -842,21 +932,61 @@ void test_mla_rope(int64_t tokens, int64_t length, int64_t heads, int64_t nope, 
                   (long long)heads, (long long)nope, (long long)rope, (long long)q_length);
     check(std::string(name) + " q", max_abs_diff(q, q_ref), 6e-7);
     check(std::string(name) + " k", max_abs_diff(k, k_ref), 6e-7);
+    digest(std::string(name) + " q", q);
+    digest(std::string(name) + " k", k);
     if (timing) {
         const int reps = 500;
         const double t0 = seconds_now();
         for (int rep = 0; rep < reps; ++rep) {
-            for (int64_t t = 0; t < tokens; ++t) {
-                montlok::mla_rope_token(p, t, scratch.data());
-            }
+            K->mla_rope_range(p, 0, tokens, scratch.data());
         }
         std::printf("  timing: mla_rope %.1f us/pass single-threaded\n", (seconds_now() - t0) / reps * 1e6);
     }
 }
 
+// The whole suite against the double references, through table K.
+void run_suite(bool timing) {
+    // Model geometry first (timed), then odd shapes for the other paths.
+    test_siso({1, 480, 8, 64, 64, false}, timing);
+    test_siso({2, 37, 3, 14, 8, true}, false);     // 8-lane blocks, strided v
+    test_siso({1, 20, 2, 5, 12, false}, false);    // scalar path (headdim not a multiple of 8)
+    test_siso({1, 1, 2, 4, 16, false}, false);     // single step
+    test_prep({1, 480, 8, 64, 64, 1, 16}, timing);
+    test_prep({2, 37, 6, 8, 14, 3, 5}, false);     // grouped B/C, odd sizes
+    test_sincos();
+    test_mhc({480, 4, 256, 20}, timing);
+    test_mhc({37, 4, 256, 20}, false);             // partial token block
+    test_mhc({50, 3, 100, 5}, false);
+    test_mhc({17, 5, 33, 0}, false);               // iters=0 still runs one Sinkhorn step
+    test_mhc({9, 1, 16, 3}, false);
+    test_mhc({6, 9, 20, 2}, false);                // n > 8: generic combine path
+    test_rms_norm(480, 256, 1, 256, timing);
+    test_rms_norm(480, 256, 8, 256, false);        // GroupedRMSNorm as used by Mamba3Layer
+    test_rms_norm(37, 100, 4, 133, false);         // odd group size, strided rows
+#ifdef MONTLOK_VECTOR_EXT
+    test_exp();
+#endif
+    test_swiglu(480, 768, 1536, timing);
+    test_swiglu(37, 50, 133, false);               // odd hidden, padded rows
+    test_layer_norm(480, 256, 256, true, timing);
+    test_layer_norm(480, 64, 64, true, false);     // kv_norm shape
+    test_layer_norm(37, 100, 133, false, false);   // odd dim, strided rows, no bias
+    test_mla_rope(480, 480, 4, 32, 32, timing);
+    test_mla_rope(74, 37, 3, 12, 10, false);       // batch 2, odd dims
+    test_mla_rope(480, 480, 4, 32, 32, false, 1);  // trailing query only
+    test_mla_rope(74, 37, 3, 12, 10, false, 5);    // batch 2, trailing 5 queries
+}
+
+void print_table(const montlok::KernelTable& table, bool supported) {
+    std::printf("variant %-9s level %d  vec %2d bytes  fma %d  avx2 %d  avx512 %d  cpu support %s\n", table.name,
+                table.level, table.vec_bytes, table.fma ? 1 : 0, table.avx2 ? 1 : 0, table.avx512 ? 1 : 0,
+                supported ? "yes" : "no");
+}
+
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);  // keep every line if a forced variant faults
     std::printf("montlok selftest:");
 #if defined(__AVX2__)
     std::printf(" avx2");
@@ -873,37 +1003,87 @@ int main() {
 #ifdef MONTLOK_VECTOR_EXT
     std::printf(" vector-ext");
 #endif
-    std::printf("\n");
+    std::printf(" vec-bytes %d\n", MONTLOK_VEC_BYTES);
+    const montlok::CpuFeatures& cpu = montlok::host_cpu();
+    std::printf("cpu: %s  avx2 %d fma %d avx512f %d os_avx %d os_avx512 %d\n", cpu.brand, cpu.avx2 ? 1 : 0,
+                cpu.fma ? 1 : 0, cpu.avx512f ? 1 : 0, cpu.os_avx ? 1 : 0, cpu.os_avx512 ? 1 : 0);
+    const char* force_env = std::getenv("MONTLOK_SELFTEST_FORCE");
+    const std::string force_list = force_env != nullptr ? force_env : "";
+    auto forced = [&](const char* name) {
+        if (force_list == "1") {
+            return true;
+        }
+        const std::string needle = "," + std::string(name) + ",";
+        return ("," + force_list + ",").find(needle) != std::string::npos;
+    };
 
-    // Model geometry first (timed), then odd shapes for the other paths.
-    test_siso({1, 480, 8, 64, 64, false}, true);
-    test_siso({2, 37, 3, 14, 8, true}, false);     // 8-lane blocks, strided v
-    test_siso({1, 20, 2, 5, 12, false}, false);    // scalar path (headdim not a multiple of 8)
-    test_siso({1, 1, 2, 4, 16, false}, false);     // single step
-    test_prep({1, 480, 8, 64, 64, 1, 16}, true);
-    test_prep({2, 37, 6, 8, 14, 3, 5}, false);     // grouped B/C, odd sizes
-    test_sincos();
-    test_mhc({480, 4, 256, 20}, true);
-    test_mhc({37, 4, 256, 20}, false);             // partial token block
-    test_mhc({50, 3, 100, 5}, false);
-    test_mhc({17, 5, 33, 0}, false);               // iters=0 still runs one Sinkhorn step
-    test_mhc({9, 1, 16, 3}, false);
-    test_mhc({6, 9, 20, 2}, false);                // n > 8: generic combine path
-    test_rms_norm(480, 256, 1, 256, true);
-    test_rms_norm(480, 256, 8, 256, false);        // GroupedRMSNorm as used by Mamba3Layer
-    test_rms_norm(37, 100, 4, 133, false);         // odd group size, strided rows
-#ifdef MONTLOK_VECTOR_EXT
-    test_exp();
-#endif
-    test_swiglu(480, 768, 1536, true);
-    test_swiglu(37, 50, 133, false);               // odd hidden, padded rows
-    test_layer_norm(480, 256, 256, true, true);
-    test_layer_norm(480, 64, 64, true, false);     // kv_norm shape
-    test_layer_norm(37, 100, 133, false, false);   // odd dim, strided rows, no bias
-    test_mla_rope(480, 480, 4, 32, 32, true);
-    test_mla_rope(74, 37, 3, 12, 10, false);       // batch 2, odd dims
-    test_mla_rope(480, 480, 4, 32, 32, false, 1);  // trailing query only
-    test_mla_rope(74, 37, 3, 12, 10, false, 5);    // batch 2, trailing 5 queries
+    // 1. The kernels compiled into this file, against the double references.
+    std::map<std::string, std::map<std::string, uint64_t>> digests;
+    std::vector<const montlok::KernelTable*> ran;
+    K = &self_table();
+    g_digests = &digests["self"];
+    ran.push_back(K);
+    std::printf("\n=== kernels compiled into the self-test (default target)\n");
+    run_suite(true);
+
+    // 2. Every linked variant the CPU supports (or all of them when forced).
+    const montlok::KernelTable* tables[montlok::kMaxKernelTables];
+    const int count = montlok::available_kernels(tables, montlok::kMaxKernelTables);
+    std::printf("\n=== %d kernel variant(s) linked\n", count);
+    for (int i = 0; i < count; ++i) {
+        print_table(*tables[i], montlok::cpu_supports(cpu, *tables[i]));
+    }
+    for (int i = 0; i < count; ++i) {
+        const bool supported = montlok::cpu_supports(cpu, *tables[i]);
+        if (!supported && !forced(tables[i]->name)) {
+            std::printf("\n=== variant %s skipped: not supported by this CPU (MONTLOK_SELFTEST_FORCE=%s runs it anyway)\n",
+                        tables[i]->name, tables[i]->name);
+            continue;
+        }
+        std::printf("\n=== variant %s%s\n", tables[i]->name, supported ? "" : " (forced)");
+        K = tables[i];
+        g_digests = &digests[tables[i]->name];
+        ran.push_back(K);
+        run_suite(true);
+    }
+    const montlok::KernelSelection selection = montlok::select_kernels(cpu, std::getenv("MONTLOK_ISA"));
+    std::printf("\nruntime selection on this CPU: %s%s%s\n", selection.table->name,
+                selection.message[0] ? "  -- " : "", selection.message);
+
+    // 3. Bitwise agreement between the tables that ran. Equal FMA availability
+    //    must give equal bits (same source, same association order); a
+    //    difference there is reported but does not fail the run, since each
+    //    variant already passed the tolerance checks above.
+    std::printf("\n=== cross-variant comparison (bitwise, per output)\n");
+    for (size_t a = 0; a < ran.size(); ++a) {
+        for (size_t b = a + 1; b < ran.size(); ++b) {
+            const auto& da = digests[ran[a]->name];
+            const auto& db = digests[ran[b]->name];
+            int same = 0;
+            int differ = 0;
+            std::string first_difference;
+            for (const auto& entry : da) {
+                const auto it = db.find(entry.first);
+                if (it == db.end()) {
+                    continue;
+                }
+                if (it->second == entry.second) {
+                    ++same;
+                } else {
+                    if (differ == 0) {
+                        first_difference = entry.first;
+                    }
+                    ++differ;
+                }
+            }
+            const bool same_fma = ran[a]->fma == ran[b]->fma;
+            std::printf("%-9s vs %-9s %3d identical, %3d differ%s%s\n", ran[a]->name, ran[b]->name, same, differ,
+                        differ ? (same_fma ? "  WARNING: same FMA availability, expected identical bits; first: "
+                                           : "  (expected: FMA availability differs; first: ")
+                               : "",
+                        differ ? first_difference.c_str() : "");
+        }
+    }
 
     if (g_failures) {
         std::printf("%d check(s) FAILED\n", g_failures);

@@ -3,17 +3,26 @@
 
     python build_montlok.py build_ext --inplace
 
-``MONTLOK_MARCH`` selects the ``-march`` value (default ``native``), e.g.
-``MONTLOK_MARCH=znver2`` when cross-building for another x86-64 microarchitecture.
+The module contains every instruction-set variant of the kernels and picks one
+at run time, so the default build runs on any CPU of its architecture.
+``MONTLOK_MARCH`` adds ``-march=<value>`` (e.g. ``native``) for a build tied to
+one machine. On macOS the extension is built for the running architecture
+only: a universal2 Python would otherwise ask for an x86_64 slice as well,
+which torch itself does not ship.
 """
 
+import os
 from pathlib import Path
+import platform
+import sys
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-from montlok_loader import HEADERS, PREBUILT_MODULE, SOURCES, compile_flags, openmp_flags
+from montlok_loader import HEADERS, PREBUILT_MODULE, SOURCES, compile_flags, link_flags
 
+if sys.platform == "darwin" and "ARCHFLAGS" not in os.environ:
+    os.environ["ARCHFLAGS"] = f"-arch {platform.machine()}"
 
 root = Path(__file__).resolve().parent
 setup(
@@ -25,7 +34,7 @@ setup(
             depends=[str(path) for path in HEADERS],
             include_dirs=[str(root)],
             extra_compile_args=compile_flags(),
-            extra_link_args=openmp_flags(),
+            extra_link_args=link_flags(),
         )
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=False)},
