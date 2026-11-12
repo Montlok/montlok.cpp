@@ -80,11 +80,10 @@ MONTLOK_API const char* montlok_last_error(void);
 MONTLOK_API void montlok_set_threads(int threads);
 MONTLOK_API int montlok_threads(void);
 
-/* Latency threads split a single prediction across cores: single rows of a
- * tree ensemble divide its trees among the calling thread and up to `threads`
- * more. Each latency thread waits for work in a spin loop and keeps its core
- * busy while it exists; 0, the default, stops them. Results are the same with
- * any number. */
+/* Latency threads compute a single prediction together with the calling
+ * thread: single rows of a tree ensemble divide their trees among the calling
+ * thread and up to `threads` more. Each latency thread spins on its core
+ * while it exists; 0, the default, stops them. */
 MONTLOK_API int montlok_set_latency_threads(int threads);
 MONTLOK_API int montlok_latency_threads(void);
 

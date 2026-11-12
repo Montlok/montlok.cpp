@@ -151,10 +151,10 @@ pub fn set_threads(threads: usize) {
     unsafe { sys::montlok_set_threads(threads.min(c_int::MAX as usize) as c_int) }
 }
 
-/// Threads that split a single prediction across cores: single rows of a tree
-/// ensemble divide its trees among the calling thread and up to `threads`
-/// more. Each spins on its core while it exists; 0 stops them. Results are the
-/// same with any number.
+/// Threads that compute a single prediction together with the calling thread:
+/// single rows of a tree ensemble divide their trees among the calling thread
+/// and up to `threads` more. Each spins on its core while it exists; 0 stops
+/// them.
 pub fn set_latency_threads(threads: usize) -> Result<()> {
     check(unsafe { sys::montlok_set_latency_threads(threads.min(c_int::MAX as usize) as c_int) })
 }
