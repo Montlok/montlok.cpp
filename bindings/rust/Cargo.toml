@@ -1,0 +1,16 @@
+[package]
+name = "montlok"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "Rust bindings to the montlok CPU runtime for quantitative trading models"
+repository = "https://github.com/Montlok/montlok.cpp"
+links = "montlok"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1.2"

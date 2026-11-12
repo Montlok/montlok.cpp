@@ -24,3 +24,5 @@ inductor*/
 *.key
 *.pem
 .env*
+bindings/rust/target/
+bindings/rust/Cargo.lock

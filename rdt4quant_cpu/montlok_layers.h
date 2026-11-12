@@ -3,13 +3,9 @@
 // around the RDT stage-1/stage-2 blocks: RMSNorm / GroupedRMSNorm, LayerNorm,
 // the SwiGLU gate and the MLA rotary embedding + key assembly.
 //
-// Torch-free like montlok_kernel.h (and, like it, compiled once per
-// instruction set through montlok_isa.h). These exist purely to cut operator count:
-// in eager PyTorch an RMSNorm is seven tiny ops (float, pow, mean, add, rsqrt,
-// mul, mul), a SwiGLU gate is two (silu, mul) and the MLA key path is ~15
-// (split, two rotate_half cats, four muls, expand, cat, ...); with 12-32
-// threads each op costs a thread fork/join that is 5-10x the arithmetic. All
-// arithmetic here is done in double and rounded to float32 once.
+// Compiled once per instruction set through montlok_isa.h, like
+// montlok_kernel.h. Each layer is one pass over its rows; all arithmetic is
+// done in double and rounded to float32 once.
 
 #pragma once
 

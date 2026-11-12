@@ -2,7 +2,7 @@
 // Apache-2.0 weight-compatible CPU inference kernel for Mamba-3 SISO.
 // The recurrence follows the public state-spaces/mamba reference equations.
 //
-// PyTorch bindings around the torch-free kernels in montlok_kernel.h,
+// PyTorch bindings around the kernels in montlok_kernel.h,
 // montlok_mhc.h and montlok_layers.h (compiled once per instruction set and
 // selected at run time, see montlok_isa.h):
 //   mamba3_siso_recurrent  vectorised recurrence over prepared q/k/v/gate
@@ -178,8 +178,8 @@ void run_workers(int64_t workers, const Task& task) {
         return;
     }
 #endif
-    // Never freed: a static Tensor destroyed at process exit can outlive the
-    // allocator. The bytes are never read.
+    // Leaked on purpose: a static Tensor destroyed at process exit can outlive
+    // the allocator. Only its shape matters to the iterator.
     static const torch::Tensor* dispatch =
         new torch::Tensor(torch::empty({at::internal::GRAIN_SIZE}, torch::dtype(torch::kByte)));
     auto iter = at::TensorIteratorConfig().add_output(*dispatch).add_input(*dispatch).build();

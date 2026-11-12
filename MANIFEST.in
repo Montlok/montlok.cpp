@@ -1,0 +1,7 @@
+include LICENSE NOTICE README.md CMakeLists.txt
+graft include
+graft src
+graft microstructure
+recursive-include rdt4quant_cpu *.cpp *.h *.inc *.sh
+graft python/montlok/rdt/reference
+global-exclude __pycache__ *.py[cod] *.so *.dylib

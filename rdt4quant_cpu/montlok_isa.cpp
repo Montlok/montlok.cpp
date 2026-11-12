@@ -1,6 +1,6 @@
 // Copyright 2026 OpenAI.
 // Apache-2.0. CPU feature detection and kernel variant selection (montlok_isa.h).
-// Compiled for the baseline target like the bindings; torch-free.
+// Compiled for the baseline target, like the bindings.
 
 #include "montlok_isa.h"
 

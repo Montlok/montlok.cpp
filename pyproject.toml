@@ -1,11 +1,32 @@
 [build-system]
-requires = ["setuptools>=70", "torch==2.11.0"]
+requires = ["setuptools>=77", "pybind11>=2.13"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "montlok-rdt-cpu"
-version = "0.1.0"
-description = "Weight-compatible CPU inference runtime for RDT4quant Mamba-3 SISO checkpoints"
+name = "montlok"
+version = "0.2.0"
+description = "CPU runtime for quantitative trading models: linear, MLP, GRU/LSTM and tree-ensemble families, plugin families, streaming microstructure features and RDT4quant kernels"
+readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "Apache-2.0"}
-dependencies = ["numpy>=2.2,<3", "torch==2.11.0"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = ["numpy>=1.26,<3"]
+
+[project.scripts]
+montlok = "montlok.cli:main"
+
+[project.optional-dependencies]
+rdt = ["torch==2.11.0"]
+test = ["pytest>=8", "scikit-learn>=1.5"]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-dir]
+"" = "python"
+
+[tool.setuptools.package-data]
+"montlok.rdt" = ["reference/config.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
