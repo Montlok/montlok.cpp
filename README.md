@@ -127,29 +127,25 @@ dtype and node index before the model is built.
 `sequential` has two precisions. `f32` (PyTorch exports) rounds the input and
 every operator's output to float32, as the float32 module does, and stores the
 weights as float32. `f64` (scikit-learn) keeps every value in double. Dot
-products accumulate in double in a fixed order, so results are the same for
-any batch size and thread count. Recurrent layers follow PyTorch's gate order
-and `h' = n + z (h - n)` update; `stream()` after T steps returns what
-`predict()` returns for those T steps.
+products accumulate in double in a fixed order. Recurrent layers follow
+PyTorch's gate order and `h' = n + z (h - n)` update; `stream()` after T steps
+returns what `predict()` returns for those T steps.
 
 `tree_ensemble` adds each output's leaves in tree order within blocks of 64
-trees, starting from the base score, and then adds the block sums in order;
-for ensembles of up to 64 trees this is the plain sum in tree order.
+trees, starting from the base score, and then adds the block sums in order.
 
 Parity in the test suite: PyTorch modules within 2e-5 of the output scale;
-scikit-learn trees, forests, boosting and linear models within 1e-12 (most
-bit-identical); LightGBM and XGBoost against reference implementations of
-their decision rules, including NaN, zero and `-0.0` inputs.
+scikit-learn trees, forests, boosting and linear models within 1e-12; LightGBM
+and XGBoost against reference implementations of their decision rules,
+including NaN, zero and `-0.0` inputs.
 
 ## Latency threads
 
 `montlok.set_latency_threads(n)` (C: `montlok_set_latency_threads`, C++ and
-Rust: `montlok::set_latency_threads`) starts n threads that split a single
-prediction across cores: a row of a tree ensemble divides its blocks of trees
-among them and the calling thread. The result is the same for every n. Each
-latency thread waits for work in a spin loop and keeps its core busy until
-`set_latency_threads(0)`. While one call uses the threads, a concurrent call
-runs on its own thread. On Linux, `MONTLOK_LATENCY_CPUS` places them on given
+Rust: `montlok::set_latency_threads`) starts n threads that compute a single
+prediction together with the calling thread: a row of a tree ensemble divides
+its blocks of trees among them. Each latency thread spins on its own core until
+`set_latency_threads(0)`. On Linux, `MONTLOK_LATENCY_CPUS` places them on given
 CPUs, such as cores reserved with `isolcpus`.
 
 | Latency threads | `xgb1000_d8` p50 | `gbr300` p50 |
@@ -159,9 +155,7 @@ CPUs, such as cores reserved with `isolcpus`.
 | 3 | 2.0 µs | 0.46 µs |
 | 7 | 1.5 µs | 0.63 µs |
 
-One row in the process on an Apple M4 Max (`montlok bench MODEL --latency-threads N`).
-A split costs about 140 ns with two parts and 210 ns with four; small models
-gain most from one to three threads.
+One row on an Apple M4 Max: `montlok bench MODEL --latency-threads N`.
 
 ## Plugins
 
@@ -199,8 +193,8 @@ part of the C ABI and `montlok::micro` in Rust.
 
 `montlok.rdt` runs RDT4quant Mamba-3 SISO checkpoints with fused C++17 kernels
 for the Mamba-3 recurrence, Manifold-Constrained Hyper-Connections, RMSNorm
-and MLA rotary embeddings (`rdt4quant_cpu/`). Checkpoints load as they are,
-and every kernel accumulates in double before rounding to float32.
+and MLA rotary embeddings (`rdt4quant_cpu/`); every kernel accumulates in
+double and rounds to float32.
 
 ```python
 from montlok import rdt
@@ -248,19 +242,11 @@ Compared with the training frameworks, from Python (`python tools/bench_core.py`
 | 300-tree GradientBoosting, one row | 1.2 µs | scikit-learn: 92 µs |
 | 300-tree GradientBoosting, 100k rows, 8 threads | 10 ms | scikit-learn: 188 ms |
 
-How the numbers come about:
-
-- Trees are re-laid out at load time for branch-free walks: one row walks 16
-  trees at a time, a batch walks 64 rows per tree.
-- Latency threads split one row across cores for about 150-200 ns.
-- `stream()` advances a recurrent model by one bar; a full window repeats every
-  step.
-- Batches spread over a worker pool (`montlok.set_threads`): 16 GRU windows
-  take 111 µs on 8 threads.
-- RDT4quant runs fused kernels for the CPU's instruction set: the full model
-  takes 6.4 ms on 12 threads.
-- Each Python call adds about 0.3 µs, or 0.2 µs with an `out` array; Rust and
-  C++ calls add 30-50 ns.
+Tree ensembles are laid out at load time as packed 16-byte nodes; one row
+walks 16 trees at a time, and a batch walks 64 rows per tree.
+`montlok.set_threads(n)` spreads batches over a worker pool (16 GRU windows:
+111 µs on 8 threads), and RDT4quant runs kernels compiled for the CPU's
+instruction set (full model: 6.4 ms on 12 threads).
 
 ## Building and testing
 
