@@ -1,13 +1,12 @@
 // Copyright 2026 OpenAI.
 // Apache-2.0 weight-compatible CPU kernels for Mamba-3 SISO.
 //
-// This header is torch-free so the same code can be compiled into the PyTorch
-// extension (montlok.cpp, through the instruction-set variants of
-// montlok_isa.h) and into the standalone self-test (montlok_selftest.cpp).
-// The recurrence follows the public state-spaces/mamba reference equations;
-// the pre-processing mirrors Mamba3CPUReference.forward in mamba3_cpu.py
-// operation by operation so the fused path stays weight- and
-// numerics-compatible with the pure PyTorch reference.
+// Plain C++17, compiled into the PyTorch extension (montlok.cpp, through the
+// instruction-set variants of montlok_isa.h) and into the standalone self-test
+// (montlok_selftest.cpp). The recurrence follows the public state-spaces/mamba
+// reference equations; the pre-processing mirrors Mamba3CPUReference.forward in
+// python/montlok/rdt/mamba3.py operation by operation, so the fused path keeps
+// the weights and numerics of the PyTorch reference.
 //
 // Performance design (SSE2 / AVX2+FMA / AVX-512 on x86-64, NEON on arm64):
 //   * The SSM state for one (batch, head) is [d_state, headdim]. Rows of the

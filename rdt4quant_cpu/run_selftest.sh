@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds and runs the torch-free kernel self-test (montlok_selftest.cpp):
+# Builds and runs the kernel self-test (montlok_selftest.cpp):
 #   1. for the host CPU, with the default 32-byte float vectors;
 #   2. again with 64-byte vectors, which exercises the AVX-512 recurrence path
 #      (the compiler splits the vectors on narrower hardware);

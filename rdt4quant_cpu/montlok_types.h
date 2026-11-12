@@ -8,7 +8,6 @@
 // this header is independent of the instruction set and stays in plain
 // namespace montlok: the plan structs that cross the variant boundary, the
 // work decomposition the PyTorch bindings schedule, and small scalar helpers.
-// It is torch-free like the kernel headers.
 
 #pragma once
 

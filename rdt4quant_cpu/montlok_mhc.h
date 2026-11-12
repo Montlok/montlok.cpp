@@ -2,13 +2,9 @@
 // Apache-2.0 weight-compatible CPU kernels for Manifold-Constrained
 // Hyper-Connections (mHC, arXiv:2512.24880) as used by the RDT stage-2 layer.
 //
-// Torch-free like montlok_kernel.h (and, like it, compiled once per
-// instruction set through montlok_isa.h). One mHC residual costs, in the PyTorch
-// reference, ~100 tiny ops per layer call (20 Sinkhorn iterations x 2
-// logsumexp x 2 subtractions on a [B*L, n, n] tensor, two batched matmuls over
-// B*L 4x4 matrices, ...). Each op is a few microseconds of work plus a thread
-// fork. Here the whole coefficient computation for one token is a single pass
-// in one thread.
+// Compiled once per instruction set through montlok_isa.h, like
+// montlok_kernel.h. The whole coefficient computation for one token, Sinkhorn
+// projection included, is a single pass in one thread.
 //
 // Numerics: every intermediate is accumulated in double precision and rounded
 // to float32 exactly once, so each output is the correctly rounded value of the

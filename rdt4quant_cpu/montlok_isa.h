@@ -14,7 +14,7 @@
 // (`avx2`, `baseline`, ...; `force:<name>` skips the CPU check, for emulators
 // that execute instructions they do not advertise).
 //
-// Torch-free: the self-test links the same variant translation units.
+// The self-test links the same variant translation units.
 
 #pragma once
 

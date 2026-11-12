@@ -1,5 +1,5 @@
 // Copyright 2026 OpenAI.
-// Torch-free self-test and micro-benchmark for the montlok CPU kernels.
+// Self-test and micro-benchmark for the montlok CPU kernels.
 //
 // Checks every kernel in montlok_kernel.h / montlok_mhc.h / montlok_layers.h
 // against a naive double-precision implementation of the same mathematics on

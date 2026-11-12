@@ -1,3 +1,4 @@
 numpy>=2.2,<3
 torch==2.11.0
-setuptools>=70
+setuptools>=77
+pybind11>=2.13

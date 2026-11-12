@@ -23,8 +23,8 @@ struct Sample {
     double count = 0;
 };
 
-// Capacity is fixed at construction. An overflow is visible to the caller;
-// observations must never be silently overwritten inside a retained window.
+// Capacity is fixed at construction. A full ring raises on the next push, so
+// every observation inside a retained window stays available.
 class Ring {
 public:
     explicit Ring(size_t capacity) : storage_(capacity) {
@@ -214,8 +214,8 @@ private:
 };
 
 // Scalers are folded into affine coefficients offline. The raw values remain
-// float64 so a threshold near a one-cent price change is not rounded early.
-// This reuses Montlok's portable SIMD primitives, without a PyTorch thread pool.
+// float64 so a threshold near a one-cent price change keeps its digits.
+// This reuses Montlok's portable SIMD primitives.
 inline void linear_heads(const double* features, const double* weights, const double* bias,
                          size_t heads, double* out) noexcept {
     for (size_t head = 0; head < heads; ++head) {

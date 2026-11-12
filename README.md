@@ -2,196 +2,296 @@
 
 # montlok.cpp
 
-**CPU inference backend for RDT4quant Mamba-3 models**
+**CPU runtime for quantitative trading models**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.11-ee4c2c.svg)](https://pytorch.org)
+[![C ABI](https://img.shields.io/badge/C%20ABI-v1-555.svg)](include/montlok/montlok.h)
 
 </div>
 
-`montlok.cpp` runs RDT4quant checkpoints on CPUs with fused C++17 kernels for
-the Mamba-3 recurrence, Manifold-Constrained Hyper-Connections, RMSNorm and
-MLA rotary embeddings. Checkpoints load unchanged, and every kernel accumulates
-in double precision before rounding to `float32`. One build runs on any x86-64
-or arm64 CPU: the kernels are compiled once per instruction set and the best
-variant the machine supports is selected at run time.
+montlok runs trained quant models on the CPU, inside the process that uses the
+prediction. Models from PyTorch, scikit-learn, LightGBM and XGBoost become one
+`.montlok` file, executed by a C++17 core that the `montlok` command, Python,
+Rust and C++ all reach through the same C ABI.
 
-## Table of Contents
-
-- [Features](#features)
-- [Requirements](#requirements)
-- [Getting Started](#getting-started)
-- [Usage](#usage)
-- [Supported CPUs](#supported-cpus)
+- [Install](#install)
+- [Commands](#commands)
+- [Library](#library)
+- [Model files](#model-files)
+- [Families and exporters](#families-and-exporters)
+- [Latency threads](#latency-threads)
+- [Plugins](#plugins)
+- [Microstructure features](#microstructure-features)
+- [RDT4quant kernels](#rdt4quant-kernels)
+- [Performance](#performance)
+- [Building and testing](#building-and-testing)
 - [Configuration](#configuration)
-- [License](#license)
 
-## Features
+## Install
 
-- **Fused Mamba-3 SISO recurrence** — pre-processing, rotary embedding and the
-  selective-scan recurrence in one operator.
-- **Fused mHC hyper-connections** — RMS statistics, projections, Sinkhorn
-  normalisation and stream mixing in two operators.
-- **Fused RMSNorm and MLA rotary/key assembly.**
-- **Drop-in** — CPU classes keep upstream parameters and state-dict keys;
-  checkpoints load with `strict=True`.
-- **Double-precision accumulation** — each operator returns the correctly
-  rounded `float32` result.
-- **One build for every CPU** — baseline (SSE2), AVX2 + FMA and AVX-512
-  variants of every kernel on x86-64, NEON on arm64; `cpuid` picks the variant
-  at run time, so a prebuilt module or wheel runs on any machine of its
-  architecture. Variants with the same FMA availability return identical bits.
-- **Multi-threaded** on PyTorch's intra-op thread pool, controlled by
-  `torch.set_num_threads`. Work is handed out dynamically, so mixed
-  performance/efficiency cores (Apple M-series, Intel Core 12th generation and
-  later) and descheduled threads do not stall an operator; on macOS the
-  extension forks through the OpenMP runtime of the PyTorch wheel.
+```bash
+pip install "montlok @ git+https://github.com/Montlok/montlok.cpp"
+pip install --no-build-isolation "montlok @ git+https://github.com/Montlok/montlok.cpp"   # also montlok.rdt, for the installed PyTorch
+```
 
-## Requirements
+## Commands
 
-| Component | Version |
+| Command | Does |
 |---|---|
-| Python | ≥ 3.12 |
-| PyTorch | 2.11 (CPU) |
-| NumPy | ≥ 2.2, < 3 |
-| Compiler | GCC ≥ 11 or Clang ≥ 15 (Apple clang included) |
-| CPU | any x86-64 (SSE2 and up) or arm64; AVX2/FMA and AVX-512 are used when present |
-
-## Getting Started
-
-### Installation
+| `montlok convert SOURCE -o MODEL` | Converts scikit-learn (`.joblib`, `.pkl`), LightGBM (`.txt`, `dump_model()` `.json`) or XGBoost (`.json`, `.ubj`) to `.montlok`. `--check INPUT` compares predictions with the source model. |
+| `montlok info MODEL` | Inputs, outputs, preprocessing, layers or trees. `--json` prints the spec. |
+| `montlok predict MODEL INPUT` | Predictions for a CSV or `.npy`. A CSV header is matched to the model's feature names; sequence models read every window of rows. |
+| `montlok bench MODEL` | In-process latency (p50 to p99.9) and calls per second. `--batch`, `--threads`, `--latency-threads`, `--stream`. |
+| `montlok serve MODEL` | Reads one request per line on stdin, `{"id": 1, "x": [...]}`, and writes `{"id": 1, "y": [...]}`. `--stream` keeps recurrent state from line to line. |
+| `montlok micro EVENTS` | The 32 microstructure features after each event of a CSV or `.npz` with `receive_ns, kind, side, a, b, c, d`. |
+| `montlok env` | Versions, CPU, thread settings and the RDT kernel variant. |
 
 ```bash
-git clone https://github.com/Montlok/montlok.cpp.git
-cd montlok.cpp
-pip install -r requirements.txt
-cd rdt4quant_cpu && python build_montlok.py build_ext --inplace
+montlok convert gbr.joblib -o gbr.montlok --check rows.csv
+montlok info gbr.montlok
+montlok predict gbr.montlok rows.csv -o predictions.csv
+montlok bench gbr.montlok --latency-threads 3
 ```
 
-```bash
-python -c "import montlok_cpp_v2; print(montlok_cpp_v2.build_info())"
-```
+`python -m montlok` runs the same command. PyTorch models are exported from
+Python ([Library](#library)).
 
-Without the prebuilt module the extension is compiled just-in-time on first
-import. `build_info()` reports the variant in use (`isa`), every variant in the
-build (`isa_variants`), the CPU features found and whether the thread pool is
-reached through OpenMP or `TensorIterator` (`parallel_dispatch`). No `-march`
-flag is used by default; `MONTLOK_MARCH=native` (or `znver2`, `x86-64-v3`, ...)
-builds for one machine only.
-
-The torch-free kernel self-test checks every compiled variant against a
-double-precision reference and compares the variants bit for bit:
-
-```bash
-cd rdt4quant_cpu && ./run_selftest.sh
-```
-
-### Quickstart
+## Library
 
 ```python
-import json, os, sys
-import torch
+import montlok
+from montlok import export
 
-os.environ["MONTLOK_CPP"] = "1"
-sys.path.insert(0, "rdt4quant_cpu")
-from model_cpu import MultiAssetRDTCPU
+export.from_torch([net.gru, export.LAST, net.head], features=40, sequence=32,
+                  preprocess={"mean": mean, "scale": scale, "clip": (-8, 8)}).save("gru.montlok")
+export.from_sklearn(pipeline).save("ridge.montlok")          # a leading StandardScaler becomes preprocessing
+export.from_lightgbm(booster).save("lgbm.montlok")
 
-config = json.load(open("rdt4quant/config.json"))
-model = MultiAssetRDTCPU(config, asset_count=31).eval()
-model.load_state_dict(torch.load("model.pt", map_location="cpu")["model"], strict=True)
-
-x = torch.randn(1, 480, 57)                        # [batch, sequence, features]
-with torch.inference_mode():
-    quantiles, hidden_rms = model(x, depth=4)      # quantiles: [batch, horizons, 3]
+model = montlok.load("gru.montlok")
+y = model.predict(window)              # [batch, 32, 40] raw features -> [batch, 1]
+model.predict(window, out)             # writes into an existing float64 array
+live = model.stream()                  # carries the GRU state from bar to bar
+y_now = live.step(features_now)        # [40] -> [1]
 ```
 
-## Usage
+Rust (`montlok = { git = "https://github.com/Montlok/montlok.cpp" }`):
 
-### Command-line tools
+```rust
+let model = montlok::Model::open("gru.montlok")?;
+let y = model.predict(&window, 1)?;            // window: &[f32] or &[f64]
+let mut live = model.stream(1)?;
+let y_now = live.step(&features_now)?;
+```
 
-| Script | Purpose |
-|---|---|
-| `benchmark_cpu.py` | End-to-end latency with a checkpoint and fixture |
-| `profile_cpu.py` | Per-layer latency attribution |
-| `bench_montlok_kernel.py` | Component and full-model benchmarks with random weights |
-| `compare_saved_predictions.py` | Chronological comparison with saved CUDA predictions |
-| `make_parity_fixture.py` | CUDA reference fixture generator |
+C++ (`add_subdirectory(montlok.cpp)`, `target_link_libraries(app PRIVATE montlok::montlok)`):
+
+```cpp
+#include <montlok/montlok.hpp>
+montlok::Model model = montlok::Model::open("gru.montlok");
+std::vector<double> y = model.predict(window, 1);
+```
+
+A loaded model is immutable and safe to call from many threads; a stream
+belongs to one thread at a time.
+
+## Model files
+
+A `.montlok` file is a [safetensors](https://github.com/huggingface/safetensors)
+file. Weights are named tensors; `__metadata__["montlok"]` holds the spec:
+
+```json
+{"schema": "montlok.model/1", "family": "sequential",
+ "inputs": {"features": 40, "sequence": 32, "names": ["ret_1", "..."]},
+ "outputs": {"size": 1},
+ "preprocess": {"mean": "preprocess.mean", "scale": "preprocess.scale", "clip": [-8, 8]},
+ "config": {"precision": "f32", "layers": [{"type": "gru", "hidden": 64, "weights": "l0"}, {"type": "last"},
+                                            {"type": "layernorm", "weight": "l2.weight", "bias": "l2.bias"},
+                                            {"type": "linear", "weight": "l3.weight", "bias": "l3.bias"}]},
+ "metadata": {"exporter": "montlok 0.2.0", "source": "torch"}}
+```
+
+`sequence` is 0 for tabular models (`[batch, features]` inputs). `preprocess`
+applies `clip((x - mean) / scale)` in float64 before the family sees the values.
+The files also open with the `safetensors` library, and `montlok.export.read`
+returns their spec and NumPy tensors. Loading validates every offset, shape,
+dtype and node index before the model is built.
+
+## Families and exporters
+
+| Family | Layers / options | Exporter |
+|---|---|---|
+| `sequential` | `linear`, `layernorm`, `rmsnorm`, `gru`, `lstm`, `last`, `mean`, `flatten`, `softmax`, `affine`, activations `relu` `leaky_relu` `elu` `gelu` `gelu_tanh` `tanh` `sigmoid` `silu` `softplus` | `from_torch` (module chains), `from_sklearn` (linear, logistic, MLP) |
+| `tree_ensemble` | `<=`/`<` splits, per-node missing handling (LightGBM None/Zero/NaN, XGBoost and scikit-learn default directions), float32 feature casting, sum or mean, identity/sigmoid/softmax/exp link | `from_lightgbm`, `from_xgboost`, `from_sklearn` (trees, forests, GradientBoosting, HistGradientBoosting) |
+
+`sequential` has two precisions. `f32` (PyTorch exports) rounds the input and
+every operator's output to float32, as the float32 module does, and stores the
+weights as float32. `f64` (scikit-learn) keeps every value in double. Dot
+products accumulate in double in a fixed order, so results are the same for
+any batch size and thread count. Recurrent layers follow PyTorch's gate order
+and `h' = n + z (h - n)` update; `stream()` after T steps returns what
+`predict()` returns for those T steps.
+
+`tree_ensemble` adds each output's leaves in tree order within blocks of 64
+trees, starting from the base score, and then adds the block sums in order;
+for ensembles of up to 64 trees this is the plain sum in tree order.
+
+Parity in the test suite: PyTorch modules within 2e-5 of the output scale;
+scikit-learn trees, forests, boosting and linear models within 1e-12 (most
+bit-identical); LightGBM and XGBoost against reference implementations of
+their decision rules, including NaN, zero and `-0.0` inputs.
+
+## Latency threads
+
+`montlok.set_latency_threads(n)` (C: `montlok_set_latency_threads`, C++ and
+Rust: `montlok::set_latency_threads`) starts n threads that split a single
+prediction across cores: a row of a tree ensemble divides its blocks of trees
+among them and the calling thread. The result is the same for every n. Each
+latency thread waits for work in a spin loop and keeps its core busy until
+`set_latency_threads(0)`. While one call uses the threads, a concurrent call
+runs on its own thread. On Linux, `MONTLOK_LATENCY_CPUS` places them on given
+CPUs, such as cores reserved with `isolcpus`.
+
+| Latency threads | `xgb1000_d8` p50 | `gbr300` p50 |
+|---:|---:|---:|
+| 0 | 6.2 µs | 0.75 µs |
+| 1 | 3.4 µs | 0.54 µs |
+| 3 | 2.0 µs | 0.46 µs |
+| 7 | 1.5 µs | 0.63 µs |
+
+One row in the process on an Apple M4 Max (`montlok bench MODEL --latency-threads N`).
+A split costs about 140 ns with two parts and 210 ns with four; small models
+gain most from one to three threads.
+
+## Plugins
+
+A model family is a `montlok_family_v1` vtable (`create`, `destroy`,
+`predict`, and optionally `stream_*`). It receives preprocessed float64 inputs
+and reads its tensors and config through the `montlok_host_v1` table it is
+given:
 
 ```bash
-MONTLOK_CPP=1 OMP_PROC_BIND=close OMP_PLACES=cores \
-python benchmark_cpu.py \
-  --checkpoint model.pt \
-  --base-config ../rdt4quant/config.json \
-  --fixture fixture.npz \
-  --threads 16 --iterations 100
+cc -O2 -shared -fPIC -Iinclude examples/plugin/ema_dot.c -o libema_dot.so
 ```
 
-### Performance tips
+```python
+montlok.load_plugin("./libema_dot.so")
+model = export.make("ema_dot", {}, {"ema.weight": w, "ema.alpha": [0.8], "ema.bias": [0.0]},
+                    features=4, sequence=6, outputs=1).load()
+```
 
-- Compare physical-core and logical-core thread counts. The kernels are
-  FMA-bound, so SMT siblings rarely help; on hybrid CPUs try the
-  performance-core count and the full count (on an M4 Max, 12 threads beat 16).
-- Pin threads with `OMP_PROC_BIND=close OMP_PLACES=cores`.
-- Keep `--compile-transformer` off; eager execution is faster with the fused
-  operators.
-- `bench_montlok_kernel.py --isa baseline` (or `avx2`, `avx512`) times another
-  kernel variant for an A/B comparison on the same machine.
+`montlok_register_family` registers a family from inside the process, for
+example one implemented in Rust or C++ by the engine itself. Built-in families
+register in `src/core/runtime.cpp`; layers of `sequential` in
+`src/core/sequential.cpp`.
 
-### Measured on an Apple M4 Max
+## Microstructure features
 
-Random weights, 12 threads, medians over 30 iterations of
-`bench_montlok_kernel.py`, same machine, same torch 2.11 wheel. "Before" is
-the previous `-march=native` build; "after" is the portable multi-variant build
-of this version (`neon` variant, OpenMP dispatch).
+`montlok.micro.FeatureEngine` keeps fixed-capacity rolling state over
+receive-ordered reference, L1 book and trade events and returns the 32
+features of schema `xstock-observable-l1-v2-32` (`montlok.micro.FEATURES`).
+`replay(...)` feeds whole event columns in C++, as `montlok micro` does; a
+rejected event (non-monotonic time, non-finite values, capacity overflow)
+faults the engine until `reset()`. The same engine is the `montlok_micro_*`
+part of the C ABI and `montlok::micro` in Rust.
 
-| Operator | Before | After |
+## RDT4quant kernels
+
+`montlok.rdt` runs RDT4quant Mamba-3 SISO checkpoints with fused C++17 kernels
+for the Mamba-3 recurrence, Manifold-Constrained Hyper-Connections, RMSNorm
+and MLA rotary embeddings (`rdt4quant_cpu/`). Checkpoints load as they are,
+and every kernel accumulates in double before rounding to float32.
+
+```python
+from montlok import rdt
+model = rdt.MultiAssetRDTCPU(config, asset_count=31).eval()
+model.load_state_dict(torch.load("model.pt", map_location="cpu")["model"], strict=True)
+with torch.inference_mode():
+    quantiles, hidden_rms = model(torch.randn(1, 480, 57), depth=4)
+```
+
+The CPU classes subclass the upstream RDT4quant modules; `rdt.use_reference(path)`
+selects which upstream tree they extend (default: the copy under
+`python/montlok/rdt/reference`). The kernels are compiled once per instruction
+set, and `cpuid` picks the variant at run time (`montlok env` shows it):
+
+| CPU | Kernel variant |
+|---|---|
+| x86-64 with AVX-512 F/VL/BW/DQ (Zen 4/5, Ice Lake, Sapphire Rapids, ...) | `avx512` |
+| x86-64 with AVX2 + FMA (Haswell, Zen 1-3, N100, ...) | `avx2` |
+| other x86-64 | `baseline` (SSE2) |
+| arm64 (Apple M-series, Graviton, Snapdragon X, ...) | `neon` |
+
+Tools in `tools/rdt/`: `benchmark_cpu.py` (latency with a checkpoint),
+`profile_cpu.py` (per layer), `bench_montlok_kernel.py` (per operator, `--isa`
+to compare variants), `compare_saved_predictions.py`, `make_parity_fixture.py`.
+`rdt4quant_cpu/run_selftest.sh` checks every variant against a double-precision
+reference.
+
+## Performance
+
+Apple M4 Max, one thread, one random row per call, in the process
+(`python tools/bench_models.py models`, then `montlok bench models/<name>.montlok`):
+
+| Model | p50 | p99 |
 |---|---:|---:|
-| Mamba-3 recurrence kernel | 0.224 ms | 0.199 ms |
-| Fused Mamba-3 op (pre-processing + recurrence) | 0.439 ms | 0.406 ms |
-| Mamba-3 layer (with both GEMMs) | 0.692 ms | 0.654 ms |
-| mHC hyper-connection | 0.166 ms | 0.128 ms |
-| RMSNorm [1, 480, 256] | 0.052 ms | 0.037 ms |
-| MLA attention block | 0.406 ms | 0.408 ms |
-| Full model, native stage-1/stage-2 tail, depth 4 | 6.67 ms | 6.44 ms |
+| `gbr300`: GradientBoosting, 300 trees of depth 5 | 0.75 µs | 0.92 µs |
+| `xgb1000_d8`: XGBoost regression, 100 features, 1000 trees of depth 8 | 6.2 µs | 9.4 µs |
+| `gru`: GRU 40 -> 64, LayerNorm+Linear head, one `stream` step | 1.8 µs | 2.3 µs |
+| `gru`, a 32-bar window | 48 µs | 62 µs |
 
-The arithmetic of every kernel is unchanged; the differences come from the
-dispatch. With `MONTLOK_OPENMP=0` (TensorIterator dispatch, dynamic chunking
-only) the same build measures 0.152 ms for the hyper-connection and 0.051 ms
-for the RMSNorm, so the OpenMP path accounts for most of the gain on the small
-operators. x86-64 numbers depend on the variant the CPU gets (`avx512` halves
-the recurrence instruction count against `avx2`) and were not measured for
-this table.
+Compared with the training frameworks, from Python (`python tools/bench_core.py`):
 
-## Supported CPUs
+| Workload | montlok | Framework |
+|---|---:|---:|
+| GRU window above | 49 µs | PyTorch 2.11: 198 µs |
+| 300-tree GradientBoosting, one row | 1.2 µs | scikit-learn: 92 µs |
+| 300-tree GradientBoosting, 100k rows, 8 threads | 10 ms | scikit-learn: 188 ms |
 
-| CPU | Kernel variant | Notes |
-|---|---|---|
-| x86-64 with AVX-512 F/VL/BW/DQ (Zen 4/5, Intel Ice Lake, Sapphire Rapids, ...) | `avx512` | one 16-lane zmm register per recurrence block |
-| x86-64 with AVX2 + FMA (Haswell, Zen 1-3, Intel N100 and later, ...) | `avx2` | the kernels of the earlier `-march=native` builds |
-| any other x86-64 (older Core 2 / Atom / Pentium, early Zhaoxin, VMs without AVX) | `baseline` | SSE2, no fused multiply-add |
-| arm64 (Apple M-series, Snapdragon X, Graviton, Raspberry Pi 4/5, Phytium, Kunpeng) | `neon` | |
-| other architectures with GCC/Clang (LoongArch, RISC-V, ppc64le) | `baseline` | generic vector extensions |
+How the numbers come about:
 
-The variant is chosen once per process from `cpuid` (including the XCR0 state
-the operating system enables); `MONTLOK_ISA` overrides it. GEMMs stay in
-PyTorch (oneDNN on x86-64 Linux, Accelerate on macOS, oneDNN + Arm Compute
-Library on aarch64 Linux), which dispatch on the CPU themselves. MSVC builds
-fall back to scalar code for every kernel.
+- Trees are re-laid out at load time for branch-free walks: one row walks 16
+  trees at a time, a batch walks 64 rows per tree.
+- Latency threads split one row across cores for about 150-200 ns.
+- `stream()` advances a recurrent model by one bar; a full window repeats every
+  step.
+- Batches spread over a worker pool (`montlok.set_threads`): 16 GRU windows
+  take 111 µs on 8 threads.
+- RDT4quant runs fused kernels for the CPU's instruction set: the full model
+  takes 6.4 ms on 12 threads.
+- Each Python call adds about 0.3 µs, or 0.2 µs with an `out` array; Rust and
+  C++ calls add 30-50 ns.
+
+## Building and testing
+
+| Target | Command |
+|---|---|
+| Python package | `pip install --no-build-isolation -e .` |
+| C/C++ library | `cmake -S . -B build && cmake --build build && ctest --test-dir build` (also builds `montlok_bench`) |
+| Rust crate | `cargo test --manifest-path bindings/rust/Cargo.toml` |
+
+Requirements: Python 3.12+, NumPy, a C++17 compiler (GCC 11+, Clang 15+,
+Apple clang), pybind11 for the Python build, and PyTorch 2.11 for
+`montlok._C`. Tests: `pytest`, `python tests/rdt/test_rdt_kernels.py`, the
+CMake test, `cargo test`; `tests/data/make_fixtures.py` regenerates the
+cross-language fixtures.
 
 ## Configuration
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MONTLOK_CPP` | unset | `1` enables the C++ backend |
-| `MONTLOK_CPP_FUSED` | `1` | `0` runs only the recurrence in C++ |
+| `MONTLOK_LATENCY_CPUS` | unset | Linux: CPUs for the latency threads, such as `2-5,8` |
+| `MONTLOK_CPP` | `1` once `montlok.rdt` is imported | `0` runs RDT4quant on the PyTorch reference |
+| `MONTLOK_CPP_FUSED` | `1` | `0` runs only the Mamba-3 recurrence in C++ |
 | `MONTLOK_CPP_MHC` | `1` | `0` runs hyper-connections in PyTorch |
 | `MONTLOK_CPP_LAYERS` | `1` | `0` runs RMSNorm and MLA rotary in PyTorch |
-| `MONTLOK_ISA` | unset | Kernel variant to use (`baseline`, `avx2`, `avx512`, `neon`); `force:<name>` skips the CPU check |
-| `MONTLOK_SERIAL_WORK` | `150000` | Work threshold below which an operator runs single-threaded |
-| `MONTLOK_MARCH` | unset | Adds `-march=<value>` to the build; the result runs only on CPUs with those features |
-| `MONTLOK_OPENMP` | `1` | `0` builds without OpenMP and dispatches through `TensorIterator` |
-| `MONTLOK_VERBOSE_BUILD` | unset | `1` prints compiler output during JIT builds |
+| `MONTLOK_ISA` | unset | RDT kernel variant (`baseline`, `avx2`, `avx512`, `neon`); `force:<name>` skips the CPU check |
+| `MONTLOK_REQUIRE_PREBUILT` | unset | `1` loads the RDT kernels from the installed `montlok._C` only |
+| `MONTLOK_RDT_REFERENCE` | bundled | directory holding the upstream `Model` package |
+| `MONTLOK_SERIAL_WORK` | `150000` | work threshold below which an RDT operator runs single-threaded |
+| `MONTLOK_MARCH` | unset | adds `-march=<value>` to the RDT kernel build |
+| `MONTLOK_OPENMP` | `1` | `0` builds the RDT kernels with ATen's own thread dispatch |
+| `MONTLOK_BUILD_TORCH` | auto | `0` skips `montlok._C` in `pip install`, `1` requires it |
 
 ## License
 
